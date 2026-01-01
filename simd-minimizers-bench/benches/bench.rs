@@ -19,10 +19,11 @@ criterion_group!(
         .warm_up_time(Duration::from_millis(500))
         .measurement_time(Duration::from_millis(2000))
         .sample_size(10);
-    targets = initial_runtime_comparison,
-        counting::count_comparisons_bench,
-        optimized, ext_nthash, buffered, local_nthash,
-        simd_minimizer, human_genome
+    targets = 
+        //initial_runtime_comparison,
+        //counting::count_comparisons_bench,
+        //optimized, ext_nthash, buffered, local_nthash,
+        simd_minimizer, //human_genome
 );
 criterion_main!(group);
 
@@ -302,46 +303,50 @@ fn simd_minimizer(c: &mut Criterion) {
     let w = 11;
     let k = 21;
 
-    let mut g = c.benchmark_group("g");
-    let mut hasher = NtHashSimd::<true>;
-    g.bench_function("split_simd_sum", |b| {
-        b.iter(|| {
-            SplitSimd
-                .sliding_min(w, hasher.hash_kmers(k, raw_packed_seq))
-                .map(|x| Simd::<u32, 8>::from(x))
-                .sum::<Simd<u32, 8>>()
+    {
+        let mut g = c.benchmark_group("initial_benchmarks");
+        let mut hasher = NtHashSimd::<true>;
+        g.bench_function("split_simd_sum", |b| {
+            b.iter(|| {
+                SplitSimd
+                    .sliding_min(w, hasher.hash_kmers(k, raw_packed_seq))
+                    .map(|x| Simd::<u32, 8>::from(x))
+                    .sum::<Simd<u32, 8>>()
+            });
         });
-    });
 
-    let hasher = NtHashSimd::<true>;
-    let mut hasher = BufferParCached::new(hasher);
-    g.bench_function("split_simd_buf_sum", |b| {
-        b.iter(|| {
-            SplitSimd
-                .sliding_min(w, hasher.hash_kmers(k, raw_packed_seq))
-                .map(|x| Simd::<u32, 8>::from(x))
-                .sum::<Simd<u32, 8>>()
+        let hasher = NtHashSimd::<true>;
+        let mut hasher = BufferParCached::new(hasher);
+        g.bench_function("split_simd_buf_sum", |b| {
+            b.iter(|| {
+                SplitSimd
+                    .sliding_min(w, hasher.hash_kmers(k, raw_packed_seq))
+                    .map(|x| Simd::<u32, 8>::from(x))
+                    .sum::<Simd<u32, 8>>()
+            });
         });
-    });
 
-    let mut hasher = NtHashSimd::<true>;
-    g.bench_function("split_simd_collect", |b| {
-        let mut v = vec![];
-        b.iter(|| {
-            v.extend(SplitSimd.sliding_min(w, hasher.hash_kmers(k, raw_packed_seq)));
-            v.clear();
+        let mut hasher = NtHashSimd::<true>;
+        g.bench_function("split_simd_collect", |b| {
+            let mut v = vec![];
+            b.iter(|| {
+                v.extend(SplitSimd.sliding_min(w, hasher.hash_kmers(k, raw_packed_seq)));
+                v.clear();
+            });
         });
-    });
 
-    let hasher = NtHashSimd::<true>;
-    let mut hasher = BufferParCached::new(hasher);
-    g.bench_function("split_simd_buf_collect", |b| {
-        let mut v = vec![];
-        b.iter(|| {
-            v.extend(SplitSimd.sliding_min(w, hasher.hash_kmers(k, raw_packed_seq)));
-            v.clear();
+        let hasher = NtHashSimd::<true>;
+        let mut hasher = BufferParCached::new(hasher);
+        g.bench_function("split_simd_buf_collect", |b| {
+            let mut v = vec![];
+            b.iter(|| {
+                v.extend(SplitSimd.sliding_min(w, hasher.hash_kmers(k, raw_packed_seq)));
+                v.clear();
+            });
         });
-    });
+        
+        g.finish();
+    }
 
     let lens = [1000000, 100000000];
     for len in lens {
@@ -385,23 +390,49 @@ fn simd_minimizer(c: &mut Criterion) {
         //     },
         // );
 
-        g.bench_function(BenchmarkId::new("minimizer_par_it_vec", len), |b| {
-            let mut vec = Vec::new();
-            b.iter(|| {
-                vec.extend(minimizers_seq_simd(packed_seq, k, w).0);
-                black_box(&mut vec).clear();
+        // Measuring throughput with benchmark group throughput settings
+        let mb_per_sec = criterion::Throughput::Bytes(len as u64);  // 1/4th byte per base but reporting it as 1 base/byte
+        
+        {
+            let mut group = c.benchmark_group(format!("simd_minimizers_{}", len));
+            group.throughput(mb_per_sec);
+            
+            group.bench_with_input(BenchmarkId::new("minimizer_par_it_vec", len), &len, |b, _| {
+                let mut vec = Vec::new();
+                b.iter(|| {
+                    vec.extend(minimizers_seq_simd::<_, NtHasher>(packed_seq, k, w).0);
+                    black_box(&mut vec).clear();
+                });
             });
-        });
-        g.bench_function(BenchmarkId::new("minimizer_par_it_sum", len), |b| {
-            b.iter(|| black_box(minimizers_seq_simd(packed_seq, k, w).0.sum::<S>()));
-        });
+            
+            group.bench_with_input(BenchmarkId::new("minimizer_par_it_sum", len), &len, |b, _| {
+                b.iter(|| black_box(minimizers_seq_simd::<_, NtHasher>(packed_seq, k, w).0.sum::<S>()));
+            });
+            
+       
+        /*
+        // These functions don't appear to be available in scope
         g.bench_function(BenchmarkId::new("minimizer_collect", len), |b| {
+            // Configure throughput in bytes processed per iteration
+            let throughput_bytes = len as u64;
+            b.throughput(criterion::Throughput::Bytes(throughput_bytes));
+            
             b.iter(|| black_box(minimizers_collect(packed_seq, k, w)));
         });
+        
         g.bench_function(BenchmarkId::new("minimizer_dedup", len), |b| {
+            // Configure throughput in bytes processed per iteration
+            let throughput_bytes = len as u64;
+            b.throughput(criterion::Throughput::Bytes(throughput_bytes));
+            
             b.iter(|| minimizers_dedup(packed_seq, k, w));
         });
+        
         g.bench_function(BenchmarkId::new("minimizer_collect_and_dedup", len), |b| {
+            // Configure throughput in bytes processed per iteration
+            let throughput_bytes = len as u64;
+            b.throughput(criterion::Throughput::Bytes(throughput_bytes));
+            
             let mut vec = Vec::new();
             b.iter(|| {
                 minimizers_collect_and_dedup::<false>(packed_seq, k, w, &mut vec);
@@ -412,6 +443,10 @@ fn simd_minimizer(c: &mut Criterion) {
         g.bench_function(
             BenchmarkId::new("minimizer_collect_and_dedup_super", len),
             |b| {
+                // Configure throughput in bytes processed per iteration
+                let throughput_bytes = len as u64;
+                b.throughput(criterion::Throughput::Bytes(throughput_bytes));
+                
                 let mut vec = Vec::new();
                 b.iter(|| {
                     minimizers_collect_and_dedup::<true>(packed_seq, k, w, &mut vec);
@@ -419,34 +454,39 @@ fn simd_minimizer(c: &mut Criterion) {
                 });
             },
         );
+        */ 
 
-        g.bench_function(BenchmarkId::new("minimizer_canonical", len), |b| {
-            let mut vec = Vec::new();
-            b.iter(|| {
-                vec.extend(canonical_minimizers_seq_simd(packed_seq, k, w).0);
-                black_box(&mut vec).clear();
-            });
-        });
-        g.bench_function(BenchmarkId::new("minimizer_canonical_dedup", len), |b| {
-            let mut vec = Vec::new();
-            b.iter(|| {
-                canonical_minimizer_collect_and_dedup::<false>(packed_seq, k, w, &mut vec);
-                black_box(&mut vec).clear();
-            });
-        });
-        g.bench_function(
-            BenchmarkId::new("minimizer_canonical_dedup__super", len),
-            |b| {
+            group.bench_with_input(BenchmarkId::new("minimizer_canonical", len), &len, |b, _| {
                 let mut vec = Vec::new();
                 b.iter(|| {
-                    canonical_minimizer_collect_and_dedup::<true>(packed_seq, k, w, &mut vec);
+                    vec.extend(canonical_minimizers_seq_simd::<_, NtHasher>(packed_seq, k, w).0);
                     black_box(&mut vec).clear();
                 });
-            },
-        );
+            });
+
+            group.bench_with_input(BenchmarkId::new("minimizer_canonical_sum", len), &len, |b, _| {
+                b.iter(|| black_box(canonical_minimizers_seq_simd::<_, NtHasher>(packed_seq, k, w).0.sum::<S>()));
+            });
+
+
+            /*
+            group.bench_with_input(BenchmarkId::new("minimizer_canonical_dedup", len), &len, |b, _| {
+                let mut vec = Vec::new();
+                b.iter(|| {
+                    canonical_minimizer_collect_and_dedup::<false>(packed_seq, k, w, &mut vec);
+                    black_box(&mut vec).clear();
+                });
+            });
+            */
+        
+            // Close the benchmark group
+            group.finish();
+        }
+ 
     }
 }
 
+/*
 fn human_genome(c: &mut Criterion) {
     let w = 11;
     let k = 21;
@@ -462,7 +502,15 @@ fn human_genome(c: &mut Criterion) {
             minimizers_collect_and_dedup::<true>(packed_text.as_slice(), k, w, &mut vec);
             black_box(&mut vec).clear();
         });
+        
+        // Calculate and print throughput
+        let genome_len = packed_text.len() * 4; // Each packed byte represents 4 bases
+        let genome_mb = (genome_len as f64) / 1_000_000.0;
+        let time = b.elapsed();
+        let throughput = genome_mb / (time.as_secs_f64());
+        eprintln!("human_genome minimizers: {:.2} MB/s", throughput);
     });
+    
     c.bench_function("human_genome_rc", |b| {
         if packed_text.len() == 0 {
             return Default::default();
@@ -472,5 +520,13 @@ fn human_genome(c: &mut Criterion) {
             canonical_minimizer_collect_and_dedup::<true>(packed_text.as_slice(), k, w, &mut vec);
             black_box(&mut vec).clear();
         });
+        
+        // Calculate and print throughput
+        let genome_len = packed_text.len() * 4; // Each packed byte represents 4 bases
+        let genome_mb = (genome_len as f64) / 1_000_000.0;
+        let time = b.elapsed();
+        let throughput = genome_mb / (time.as_secs_f64());
+        eprintln!("human_genome canonical: {:.2} MB/s", throughput);
     });
 }
+*/

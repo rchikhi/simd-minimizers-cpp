@@ -129,6 +129,7 @@ mod collect;
 mod minimizers;
 mod nthash;
 mod sliding_min;
+mod cpp_bindings;
 
 #[cfg(test)]
 mod test;
@@ -155,6 +156,29 @@ pub mod private {
     }
     pub mod sliding_min {
         pub use crate::sliding_min::*;
+    }
+    pub mod cpp {
+        pub use crate::cpp_bindings::{
+            cpp_canonical_minimizer_positions,
+            cpp_test_nthash_scalar_unrolled,
+            cpp_benchmark_nthash_simd,
+            cpp_test_sliding_min_scalar,
+            cpp_benchmark_sliding_min_scalar,
+            cpp_test_sliding_min_simd,
+            cpp_benchmark_sliding_min_simd,
+            cpp_test_packed_seq,
+            cpp_benchmark_packed_seq_simd,
+            cpp_benchmark_nthash_packed_seq,
+            cpp_benchmark_fused_pipeline,
+            cpp_benchmark_noncanonical_full,
+            cpp_benchmark_canonical_full_direct,
+            cpp_benchmark_canonical_phases,
+            cpp_profile_collection_phases,
+            cpp_benchmark_collection_components,
+            CollectionPhaseTiming,
+            CanonicalPhaseTiming,
+            IsolatedCollectionTiming,
+        };
     }
     pub use packed_seq::u32x8 as S;
 }
@@ -247,6 +271,28 @@ pub mod mul_hash {
     ) {
         let head_tail = canonical_minimizers_seq_simd::<_, MulHasher>(seq, k, w);
         collect_and_dedup_into::<false>(head_tail, out_vec);
+    }
+}
+
+/// C++ implementations of key algorithms.
+///
+/// This module provides C++ implementations of the most performance-critical
+/// algorithms, which can sometimes be faster than the Rust implementation
+/// due to better SIMD compiler optimizations.
+pub mod cpp {
+    /// Deduplicated positions of all canonical minimizers in the sequence,
+    /// using the C++ implementation with AVX2 SIMD instructions.
+    ///
+    /// `l=w+k-1` must be odd to determine the strand of each window.
+    ///
+    /// Positions are appended to a reusable `out_vec` to avoid allocations.
+    pub fn canonical_minimizer_positions(
+        seq_data: &[u8],
+        k: usize,
+        w: usize,
+        out_vec: &mut Vec<u32>,
+    ) {
+        crate::cpp_bindings::cpp_canonical_minimizer_positions(seq_data, k, w, out_vec);
     }
 }
 

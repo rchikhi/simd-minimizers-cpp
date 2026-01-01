@@ -7,12 +7,18 @@ use packed_seq::complement_base;
 use packed_seq::Seq;
 use wide::u32x8;
 
+// Debug level
+// 0 = minimal output
+// 1 = print hashes for each position
+// 2 = print all debug information
+pub static mut DEBUG_LEVEL: u8 = 0;
+
 pub trait Captures<U> {}
 impl<T: ?Sized, U> Captures<U> for T {}
 
 /// Original ntHash seed values.
 // TODO: Update to guarantee unique hash values for k<=16?
-const HASHES_F: [u32; 4] = [
+pub const HASHES_F: [u32; 4] = [
     0x3c8b_fbb3_95c6_0474u64 as u32,
     0x3193_c185_62a0_2b4cu64 as u32,
     0x2032_3ed0_8257_2324u64 as u32,
@@ -156,13 +162,40 @@ pub fn nthash_kmer<'s, const RC: bool, H: CharHasher>(seq: impl Seq<'s>) -> u32 
     let k = seq.len();
     let mut hfw: u32 = 0;
     let mut hrc: u32 = 0;
-    seq.iter_bp().for_each(|a| {
+    
+    unsafe {
+        if DEBUG_LEVEL >= 2 {
+            println!("DEBUG nthash_kmer: k={}, RC={}", k, RC);
+        }
+    }
+    
+    seq.iter_bp().enumerate().for_each(|(i, a)| {
+        let prev_fw = hfw;
+        let prev_rc = hrc;
+        
         hfw = hfw.rotate_left(1) ^ hasher.f(a);
         if RC {
             hrc = hrc.rotate_right(1) ^ hasher.c(a);
         }
+        
+        unsafe {
+            if DEBUG_LEVEL >= 2 {
+                println!("DEBUG nthash_kmer: base[{}]={}, fw: 0x{:08x}->0x{:08x}, rc: 0x{:08x}->0x{:08x}", 
+                        i, a, prev_fw, hfw, prev_rc, hrc);
+            }
+        }
     });
-    hfw.wrapping_add(hrc.rotate_left(k as u32 - 1))
+    
+    let final_hash = hfw.wrapping_add(hrc.rotate_left(k as u32 - 1));
+    
+    unsafe {
+        if DEBUG_LEVEL >= 2 {
+            println!("DEBUG nthash_kmer: final hash: fw=0x{:08x}, rc=0x{:08x}, rotated_rc=0x{:08x}, hash=0x{:08x}", 
+                    hfw, hrc, hrc.rotate_left(k as u32 - 1), final_hash);
+        }
+    }
+            
+    final_hash
 }
 
 /// Returns a scalar iterator over the 32-bit NT hashes of all k-mers in the sequence.
@@ -180,22 +213,81 @@ pub fn nthash_seq_scalar<'s, const RC: bool, H: CharHasher>(
     let mut hrc: u32 = 0;
     let mut add = seq.iter_bp();
     let remove = seq.iter_bp();
-    add.by_ref().take(k - 1).for_each(|a| {
+    
+    unsafe {
+        if DEBUG_LEVEL >= 2 {
+            println!("DEBUG nthash_seq_scalar: k={}, RC={}", k, RC);
+            println!("DEBUG nthash_seq_scalar: Initial: hfw=0x{:08x}, hrc=0x{:08x}", hfw, hrc);
+        }
+    }
+    
+    // Initialize the hash values with the first k-1 bases
+    add.by_ref().take(k - 1).enumerate().for_each(|(i, a)| {
+        let prev_fw = hfw;
+        let prev_rc = hrc;
+        
         hfw = hfw.rotate_left(1) ^ hasher.f(a);
         if RC {
             hrc = hrc.rotate_right(1) ^ hasher.c_rot(a);
         }
+        
+        unsafe {
+            if DEBUG_LEVEL >= 2 {
+                println!("DEBUG nthash_seq_scalar: init[{}] base={}, fw: 0x{:08x}->0x{:08x}, rc: 0x{:08x}->0x{:08x}",
+                        i, a, prev_fw, hfw, prev_rc, hrc);
+            }
+        }
     });
+    
+    unsafe {
+        if DEBUG_LEVEL >= 2 {
+            println!("DEBUG nthash_seq_scalar: After initialization: hfw=0x{:08x}, hrc=0x{:08x}", hfw, hrc);
+        }
+    }
+    
+    // Process each position, adding one base and removing one base
+    let mut position = 0;
     add.zip(remove).map(move |(a, r)| {
+        let prev_fw = hfw;
+        let prev_rc = hrc;
+        
+        // Add a new base to forward and reverse hash
         let hfw_out = hfw.rotate_left(1) ^ hasher.f(a);
+        let hrc_out = if RC {
+            hrc.rotate_right(1) ^ hasher.c_rot(a)
+        } else {
+            0
+        };
+        
+        // Update for next position by removing the oldest base
         hfw = hfw_out ^ hasher.f_rot(r);
         if RC {
-            let hrc_out = hrc.rotate_right(1) ^ hasher.c_rot(a);
             hrc = hrc_out ^ hasher.c(r);
+        }
+        
+        // Calculate final hash value
+        let result = if RC {
             hfw_out.wrapping_add(hrc_out)
         } else {
             hfw_out
+        };
+        
+        unsafe {
+            if DEBUG_LEVEL >= 2 {
+                println!("DEBUG nthash_seq_scalar: pos={}, add_base={}, remove_base={}", position, a, r);
+                println!("DEBUG nthash_seq_scalar:   fw: 0x{:08x}->0x{:08x}->0x{:08x}", prev_fw, hfw_out, hfw);
+                if RC {
+                    println!("DEBUG nthash_seq_scalar:   rc: 0x{:08x}->0x{:08x}->0x{:08x}", prev_rc, hrc_out, hrc);
+                    println!("DEBUG nthash_seq_scalar:   hash=0x{:08x}", result);
+                }
+            } else if DEBUG_LEVEL == 1 {
+                // Print just the position and hash at level 1
+                println!("Position {} hash=0x{:08x}", position + 1, result);
+            }
         }
+        
+        position += 1;
+        result
     })
 }
 

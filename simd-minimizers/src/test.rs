@@ -225,7 +225,7 @@ fn minimizer_positions() {
 }
 
 #[test]
-fn canonical_minimizer_positions() {
+fn test_canonical_minimizer_positions() {
     test_on_inputs(|k, w, _slice, ascii_seq, packed_seq| {
         if (k + w - 1) % 2 == 0 {
             return;
@@ -244,4 +244,161 @@ fn canonical_minimizer_positions() {
         assert_eq!(scalar_ascii, simd_ascii, "k={k}, w={w}, len={len}");
         assert_eq!(scalar_ascii, simd_packed, "k={k}, w={w}, len={len}");
     });
+}
+
+// Test that C++ and Rust implementations produce identical results
+#[test]
+fn test_cpp_vs_rust_canonical_minimizers() {
+    use crate::cpp_bindings::cpp_canonical_minimizer_positions;
+
+    /// Debug helper: prints detailed hash/minimizer info for troubleshooting
+    fn debug_canonical_pipeline(k: usize, w: usize, data: &[u8]) {
+        let test_packed_seq = PackedSeqVec::from_ascii(data);
+
+        // Canonicality per window
+        let canonical_windows: Vec<_> = crate::canonical::canonical_windows_seq_scalar(
+            test_packed_seq.as_slice(), k, w).collect();
+        eprintln!("Windows ({}): {:?}", canonical_windows.len(),
+            canonical_windows.iter().map(|c| if *c {'L'} else {'R'}).collect::<String>());
+
+        // Hash values
+        let hashes: Vec<_> = crate::nthash::nthash_seq_scalar::<true, crate::NtHasher>(
+            test_packed_seq.as_slice(), k).collect();
+        eprintln!("Hashes: {:?}", hashes.iter().map(|h| format!("{:08x}", h)).collect::<Vec<_>>());
+
+        // Left/right minimizers
+        let left: Vec<_> = crate::sliding_min::sliding_min_scalar::<true>(hashes.iter().cloned(), w).collect();
+        let right: Vec<_> = crate::sliding_min::sliding_min_scalar::<false>(hashes.iter().cloned(), w).collect();
+        eprintln!("Left mins:  {:?}", left);
+        eprintln!("Right mins: {:?}", right);
+
+        // Final selection
+        let selected: Vec<_> = canonical_windows.iter().zip(left.iter().zip(right.iter()))
+            .map(|(c, (l, r))| if *c { *l } else { *r }).collect();
+        eprintln!("Selected: {:?}", selected);
+    }
+
+    fn compare_implementations(k: usize, w: usize, data: &[u8]) {
+        if (k + w - 1) % 2 == 0 || data.len() < k + w - 1 {
+            return; // Skip invalid cases
+        }
+
+        let packed_seq = PackedSeqVec::from_ascii(data);
+        let mut rust_results = Vec::new();
+        canonical_minimizer_positions(packed_seq.as_slice(), k, w, &mut rust_results);
+
+        let mut cpp_results = Vec::new();
+        cpp_canonical_minimizer_positions(data, k, w, &mut cpp_results);
+
+        // Debug output for specific test cases (run with --nocapture to see)
+        if (k == 3 || k == 9) && w == 3 && data.len() == 12 {
+            eprintln!("\n=== DEBUG k={}, w={} ===", k, w);
+            eprintln!("Rust: {:?}", rust_results);
+            eprintln!("C++:  {:?}", cpp_results);
+            debug_canonical_pipeline(k, w, data);
+        }
+
+        let mut sorted_rust = rust_results.clone();
+        let mut sorted_cpp = cpp_results.clone();
+        sorted_rust.sort_unstable();
+        sorted_cpp.sort_unstable();
+
+        assert_eq!(sorted_rust, sorted_cpp,
+            "Results differ for k={}, w={}, seq={:?}",
+            k, w, String::from_utf8_lossy(&data[..std::cmp::min(data.len(), 100)]));
+    }
+
+    // Test with fixed sequences
+    for seq in [b"ACGTACGTACGT".as_slice(), b"AAAAAAACCCCCCCGGGGGGGTTTTTTT",
+                b"ACGTACGTACGTACGTACGTACGTACGTACGT"] {
+        for k in [3, 5, 7, 9] {
+            for w in [3, 5, 7, 9] {
+                compare_implementations(k, w, seq);
+            }
+        }
+    }
+
+    // Test with random sequences
+    let random_seq = &*ASCII_SEQ;
+    for len in [64, 128, 256, 512] {
+        let seq = random_seq.slice(0..len);
+        for k in [3, 5, 7, 9] {
+            for w in [3, 5, 7, 9] {
+                compare_implementations(k, w, &seq.0);
+            }
+        }
+    }
+}
+
+// Test with larger sequences to catch deduplication issues
+#[test]
+fn test_cpp_vs_rust_canonical_minimizers_large() {
+    use crate::cpp_bindings::cpp_canonical_minimizer_positions;
+    use rand::Rng;
+
+    // Generate a random 1M sequence
+    let bases = b"ACGT";
+    let mut rng = rand::rng();
+    let seq_data: Vec<u8> = (0..1_000_000).map(|_| bases[rng.random_range(0..4)]).collect();
+    let packed_seq = PackedSeqVec::from_ascii(&seq_data);
+
+    let k = 5;
+    let w = 5;
+
+    // Get results from Rust implementation
+    let mut rust_results = Vec::new();
+    canonical_minimizer_positions(packed_seq.as_slice(), k, w, &mut rust_results);
+
+    // Get results from C++ implementation
+    let mut cpp_results = Vec::new();
+    cpp_canonical_minimizer_positions(&seq_data, k, w, &mut cpp_results);
+
+    // Check for consecutive duplicates (should not happen after dedup)
+    let mut cpp_dups = Vec::new();
+    for i in 1..cpp_results.len() {
+        if cpp_results[i] == cpp_results[i-1] {
+            cpp_dups.push((i, cpp_results[i]));
+        }
+    }
+
+    if !cpp_dups.is_empty() {
+        println!("C++ has {} consecutive duplicates:", cpp_dups.len());
+        for (idx, pos) in cpp_dups.iter().take(10) {
+            println!("  At index {}: position {}", idx, pos);
+        }
+    }
+
+    // Compare unsorted first (to catch ordering issues)
+    if rust_results != cpp_results {
+        println!("Outputs differ (unsorted):");
+        println!("  Rust len: {}", rust_results.len());
+        println!("  C++ len: {}", cpp_results.len());
+
+        // Find first difference
+        let min_len = rust_results.len().min(cpp_results.len());
+        for i in 0..min_len {
+            if rust_results[i] != cpp_results[i] {
+                println!("  First diff at index {}: Rust={}, C++={}", i, rust_results[i], cpp_results[i]);
+                let start = i.saturating_sub(3);
+                let end = (i + 4).min(min_len);
+                println!("  Context Rust[{}..{}]: {:?}", start, end, &rust_results[start..end]);
+                println!("  Context C++[{}..{}]: {:?}", start, end, &cpp_results[start..end]);
+                break;
+            }
+        }
+    }
+
+    // Assert no consecutive duplicates in C++ output
+    assert!(cpp_dups.is_empty(),
+        "C++ implementation has {} consecutive duplicates after dedup", cpp_dups.len());
+
+    // Compare sorted results
+    let mut sorted_rust = rust_results.clone();
+    let mut sorted_cpp = cpp_results.clone();
+    sorted_rust.sort_unstable();
+    sorted_cpp.sort_unstable();
+
+    assert_eq!(sorted_rust, sorted_cpp,
+        "Sorted results differ: Rust has {} elements, C++ has {}",
+        sorted_rust.len(), sorted_cpp.len());
 }

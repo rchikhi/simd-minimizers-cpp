@@ -23,13 +23,24 @@ Make sure to set `RUSTFLAGS="-C target-cpu=native"` when compiling to use the in
     RUSTFLAGS="-C target-cpu=native" cargo run --release
 
 
+## Implementations
+
+This library provides two implementations of the algorithm:
+
+1. **Rust Implementation**: The primary implementation in Rust using SIMD intrinsics through the `wide` crate.
+2. **C++ Implementation**: An alternative implementation in C++ using AVX2 intrinsics directly, which may provide better performance in some cases.
+
+Both implementations should produce identical results, but performance may vary depending on your specific use case and compiler optimizations.
+
 
 ## Usage example
 
 Full documentation can be found on [docs.rs](https://docs.rs/simd-minimizers).
 
+### Rust Implementation
+
 ```rust
-// Packed SIMD version.
+// Packed SIMD version with Rust implementation
 use packed_seq::{complement_char, PackedSeqVec, SeqVec};
 let seq = b"ACGTGCTCAGAGACTCAG";
 let k = 5;
@@ -40,3 +51,26 @@ let mut minimizer_positions = Vec::new();
 simd_minimizers::canonical_minimizer_positions(packed_seq.as_slice(), k, w, &mut minimizer_positions);
 assert_eq!(minimizer_positions, vec![3, 5, 12]);
 ```
+
+### C++ Implementation
+
+```rust
+// Using the C++ implementation directly
+let seq = b"ACGTGCTCAGAGACTCAG";
+let k = 5;
+let w = 7;
+
+let mut minimizer_positions = Vec::new();
+simd_minimizers::cpp::canonical_minimizer_positions(seq, k, w, &mut minimizer_positions);
+assert_eq!(minimizer_positions, vec![3, 5, 12]);
+```
+
+## Benchmarking
+
+You can compare the performance of both implementations using the provided benchmark:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo run --release --example cpp_comparison
+```
+
+The C++ implementation may be faster in some cases due to better SIMD compiler optimizations.

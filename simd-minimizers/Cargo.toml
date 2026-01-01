@@ -8,11 +8,17 @@ keywords = ["minimizers", "simd", "dna", "bioinformatics"]
 categories = ["compression", "data-structures", "science::bioinformatics"]
 authors = ["Ragnar Groot Koerkamp", "Igor Martayan"]
 description = "A SIMD-accelerated library to compute random minimizers"
+build = "build.rs"
 
 [dependencies]
 itertools = "0.14"
 packed-seq.workspace = true
 wide = "0.7.30"
+libc = "0.2"
+hex = "0.4.3"
+
+[build-dependencies]
+cc = "1.0"
 
 [dev-dependencies]
 rand = "0.9"
@@ -20,3 +26,4 @@ rand = "0.9"
 [features]
 # Hides the `simd` warnings when neither AVX2 nor NEON is detected.
 hide-simd-warning = []
+
