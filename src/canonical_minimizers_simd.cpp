@@ -234,9 +234,15 @@ struct SlidingMinState {
     size_t idx;
     u32x8 val_mask;
     u32x8 pos_mask;
-    u32x8 max_pos;
     u32x8 pos;
     u32x8 pos_offset;
+    // Pre-computed constants (hoisted from hot path)
+    u32x8 one;
+    u32x8 delta;
+    // Scalar tracking for efficient overflow check (all lanes advance together)
+    uint32_t pos_scalar;
+    uint32_t max_pos_scalar;
+    uint32_t delta_scalar;
 
     SlidingMinState(size_t w_, size_t chunk_size, size_t k, size_t initial_pos = 0)
         : w(w_), idx(0) {
@@ -244,8 +250,13 @@ struct SlidingMinState {
         prefix_min = _mm256_set1_epi32(0xFFFFFFFF);
         val_mask = _mm256_set1_epi32(0xFFFF0000);
         pos_mask = _mm256_set1_epi32(0x0000FFFF);
-        max_pos = _mm256_set1_epi32((1 << 16) - 1);
         pos = _mm256_set1_epi32(initial_pos);
+        // Pre-compute constants
+        one = _mm256_set1_epi32(1);
+        delta_scalar = (1 << 16) - 2 - (uint32_t)w;
+        delta = _mm256_set1_epi32(delta_scalar);
+        max_pos_scalar = (1 << 16) - 1;
+        pos_scalar = initial_pos;
 
         alignas(32) int32_t offsets[8];
         for (int i = 0; i < 8; i++) {
@@ -254,29 +265,23 @@ struct SlidingMinState {
         pos_offset = _mm256_load_si256(reinterpret_cast<const __m256i*>(offsets));
     }
 
-    // Handle position overflow - trigger when ALL lanes reach max_pos
-    // (all lanes process synchronously, so they should all overflow together)
-    FORCE_INLINE void check_and_reset_overflow() {
-        u32x8 cmp = _mm256_cmpeq_epi32(pos, max_pos);
-        // Check if ALL lanes matched (all bytes of cmp are 0xFF)
-        if (_mm256_movemask_epi8(cmp) == -1) {
-            u32x8 delta = _mm256_set1_epi32((1 << 16) - 2 - (uint32_t)w);
+    FORCE_INLINE u32x8 process(u32x8 hash) {
+        // Simplified overflow check using scalar tracking (all lanes advance together)
+        if (__builtin_expect(pos_scalar == max_pos_scalar, 0)) {
             pos = _mm256_sub_epi32(pos, delta);
             prefix_min = _mm256_sub_epi32(prefix_min, delta);
             pos_offset = _mm256_add_epi32(pos_offset, delta);
+            pos_scalar -= delta_scalar;
             for (auto& elem : ring_buf) {
                 elem = _mm256_sub_epi32(elem, delta);
             }
         }
-    }
-
-    FORCE_INLINE u32x8 process(u32x8 hash) {
-        check_and_reset_overflow();
 
         u32x8 elem = _mm256_or_si256(_mm256_and_si256(hash, val_mask), pos);
         ring_buf[idx] = elem;
         prefix_min = _mm256_min_epu32(prefix_min, elem);
-        pos = _mm256_add_epi32(pos, _mm256_set1_epi32(1));
+        pos = _mm256_add_epi32(pos, one);
+        pos_scalar++;
         idx++;
 
         if (idx == w) {
@@ -309,9 +314,16 @@ struct SlidingLRMinState {
     size_t idx;
     u32x8 val_mask;
     u32x8 pos_mask;
-    u32x8 max_pos;
     u32x8 pos;
     u32x8 pos_offset;
+    // Pre-computed constants (hoisted from hot path)
+    u32x8 one;
+    u32x8 neg_one;  // For inverting hash
+    u32x8 delta;
+    // Scalar tracking for efficient overflow check (all lanes advance together)
+    uint32_t pos_scalar;
+    uint32_t max_pos_scalar;
+    uint32_t delta_scalar;
 
     SlidingLRMinState(size_t w_, size_t chunk_size, size_t k, size_t initial_pos = 0)
         : w(w_), idx(0) {
@@ -320,8 +332,14 @@ struct SlidingLRMinState {
         prefix_rmax = _mm256_setzero_si256();
         val_mask = _mm256_set1_epi32(0xFFFF0000);
         pos_mask = _mm256_set1_epi32(0x0000FFFF);
-        max_pos = _mm256_set1_epi32((1 << 16) - 1);
         pos = _mm256_set1_epi32(initial_pos);
+        // Pre-compute constants
+        one = _mm256_set1_epi32(1);
+        neg_one = _mm256_set1_epi32(-1);
+        delta_scalar = (1 << 16) - 2 - (uint32_t)w;
+        delta = _mm256_set1_epi32(delta_scalar);
+        max_pos_scalar = (1 << 16) - 1;
+        pos_scalar = initial_pos;
 
         alignas(32) int32_t offsets[8];
         for (int i = 0; i < 8; i++) {
@@ -330,41 +348,34 @@ struct SlidingLRMinState {
         pos_offset = _mm256_load_si256(reinterpret_cast<const __m256i*>(offsets));
     }
 
-    // Handle position overflow - trigger when ALL lanes reach max_pos
-    // (all lanes process synchronously, so they should all overflow together)
-    FORCE_INLINE void check_and_reset_overflow() {
-        u32x8 cmp = _mm256_cmpeq_epi32(pos, max_pos);
-        // Check if ALL lanes matched (all bytes of cmp are 0xFF)
-        if (_mm256_movemask_epi8(cmp) == -1) {
-            u32x8 delta = _mm256_set1_epi32((1 << 16) - 2 - (uint32_t)w);
+    // Process hash and return (left_min_pos, right_min_pos)
+    FORCE_INLINE std::pair<u32x8, u32x8> process(u32x8 hash) {
+        // Simplified overflow check using scalar tracking (all lanes advance together)
+        if (__builtin_expect(pos_scalar == max_pos_scalar, 0)) {
             pos = _mm256_sub_epi32(pos, delta);
             prefix_lmin = _mm256_sub_epi32(prefix_lmin, delta);
             prefix_rmax = _mm256_sub_epi32(prefix_rmax, delta);
             pos_offset = _mm256_add_epi32(pos_offset, delta);
+            pos_scalar -= delta_scalar;
             for (auto& [l, r] : ring_buf) {
                 l = _mm256_sub_epi32(l, delta);
                 r = _mm256_sub_epi32(r, delta);
             }
         }
-    }
-
-    // Process hash and return (left_min_pos, right_min_pos)
-    FORCE_INLINE std::pair<u32x8, u32x8> process(u32x8 hash) {
-        // Check for position overflow
-        check_and_reset_overflow();
 
         // Left: smaller hash wins, earlier position as tiebreaker
         u32x8 lelem = _mm256_or_si256(_mm256_and_si256(hash, val_mask), pos);
         // Right: invert hash so max becomes min, later position as tiebreaker
         u32x8 relem = _mm256_or_si256(
-            _mm256_and_si256(_mm256_xor_si256(hash, _mm256_set1_epi32(-1)), val_mask),
+            _mm256_and_si256(_mm256_xor_si256(hash, neg_one), val_mask),
             pos);
 
         ring_buf[idx] = {lelem, relem};
         prefix_lmin = _mm256_min_epu32(prefix_lmin, lelem);
         prefix_rmax = _mm256_max_epu32(prefix_rmax, relem);
 
-        pos = _mm256_add_epi32(pos, _mm256_set1_epi32(1));
+        pos = _mm256_add_epi32(pos, one);
+        pos_scalar++;
         idx++;
 
         if (idx == w) {
