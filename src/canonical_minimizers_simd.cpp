@@ -26,18 +26,21 @@ static constexpr uint32_t ROT = 7;
 // SIMD Utility Functions
 // =============================================================================
 
+// Force inline for hot path functions (matches Rust's aggressive inlining)
+#define FORCE_INLINE __attribute__((always_inline)) inline
+
 // Table lookup using AVX2
-static inline u32x8 table_lookup_avx2(u32x8 table, u32x8 indices) {
+static FORCE_INLINE u32x8 table_lookup_avx2(u32x8 table, u32x8 indices) {
     return _mm256_permutevar8x32_epi32(table, indices);
 }
 
 // SIMD rotate left by ROT bits
-static inline u32x8 simd_rotl(u32x8 x) {
+static FORCE_INLINE u32x8 simd_rotl(u32x8 x) {
     return _mm256_or_si256(_mm256_slli_epi32(x, ROT), _mm256_srli_epi32(x, 32 - ROT));
 }
 
 // SIMD rotate right by ROT bits
-static inline u32x8 simd_rotr(u32x8 x) {
+static FORCE_INLINE u32x8 simd_rotr(u32x8 x) {
     return _mm256_or_si256(_mm256_srli_epi32(x, ROT), _mm256_slli_epi32(x, 32 - ROT));
 }
 
@@ -57,7 +60,7 @@ struct NtHashSimdState {
 // nthash_init is no longer needed - hash state is initialized inline in the pipeline functions
 // Keeping the struct definition for reference but removing the unused initializer
 
-static inline u32x8 nthash_step(NtHashSimdState& state, u32x8 a, u32x8 r) {
+static FORCE_INLINE u32x8 nthash_step(NtHashSimdState& state, u32x8 a, u32x8 r) {
     u32x8 hfw_out = _mm256_xor_si256(simd_rotl(state.h_fw), table_lookup_avx2(state.simd_f, a));
     state.h_fw = _mm256_xor_si256(hfw_out, table_lookup_avx2(state.simd_f_rot, r));
 
@@ -253,7 +256,7 @@ struct SlidingMinState {
 
     // Handle position overflow - trigger when ALL lanes reach max_pos
     // (all lanes process synchronously, so they should all overflow together)
-    inline void check_and_reset_overflow() {
+    FORCE_INLINE void check_and_reset_overflow() {
         u32x8 cmp = _mm256_cmpeq_epi32(pos, max_pos);
         // Check if ALL lanes matched (all bytes of cmp are 0xFF)
         if (_mm256_movemask_epi8(cmp) == -1) {
@@ -267,7 +270,7 @@ struct SlidingMinState {
         }
     }
 
-    inline u32x8 process(u32x8 hash) {
+    FORCE_INLINE u32x8 process(u32x8 hash) {
         check_and_reset_overflow();
 
         u32x8 elem = _mm256_or_si256(_mm256_and_si256(hash, val_mask), pos);
@@ -329,7 +332,7 @@ struct SlidingLRMinState {
 
     // Handle position overflow - trigger when ALL lanes reach max_pos
     // (all lanes process synchronously, so they should all overflow together)
-    inline void check_and_reset_overflow() {
+    FORCE_INLINE void check_and_reset_overflow() {
         u32x8 cmp = _mm256_cmpeq_epi32(pos, max_pos);
         // Check if ALL lanes matched (all bytes of cmp are 0xFF)
         if (_mm256_movemask_epi8(cmp) == -1) {
@@ -346,7 +349,7 @@ struct SlidingLRMinState {
     }
 
     // Process hash and return (left_min_pos, right_min_pos)
-    inline std::pair<u32x8, u32x8> process(u32x8 hash) {
+    FORCE_INLINE std::pair<u32x8, u32x8> process(u32x8 hash) {
         // Check for position overflow
         check_and_reset_overflow();
 
@@ -408,7 +411,7 @@ struct CanonicalMapper {
     // Process (add, remove_l) and return canonical mask
     // Returns all-1s (-1) if canonical, all-0s if not
     // IMPORTANT: Match Rust behavior - check happens AFTER add but BEFORE subtract
-    inline i32x8 process(u32x8 add, u32x8 remove_l) {
+    FORCE_INLINE i32x8 process(u32x8 add, u32x8 remove_l) {
         // Count TG bases: T=2 (binary 10), G=3 (binary 11) both have bit 1 set
         // So (base & 2) gives 2 for TG, 0 for AC
         i32x8 add_i = _mm256_and_si256(add, two);
@@ -428,7 +431,7 @@ struct CanonicalMapper {
 // SIMD Blend - Select lmin where mask is -1, rmin where mask is 0
 // =============================================================================
 
-static inline u32x8 simd_blend(i32x8 mask, u32x8 lmin, u32x8 rmin) {
+static FORCE_INLINE u32x8 simd_blend(i32x8 mask, u32x8 lmin, u32x8 rmin) {
     // mask is either all-1s or all-0s per lane
     // blendv selects from second operand where mask bit is 1
     return _mm256_blendv_epi8(rmin, lmin, mask);
@@ -528,7 +531,7 @@ void minimizers_simd_packed_seq(
 // Based on: https://stackoverflow.com/questions/25622745/transpose-an-8x8-float-using-avx-avx2
 // =============================================================================
 
-inline void transpose_8x8(const u32x8 m[8], u32x8 t[8]) {
+FORCE_INLINE void transpose_8x8(const u32x8 m[8], u32x8 t[8]) {
     // Treat as float for shuffle operations (same bit pattern)
     __m256 m0 = _mm256_castsi256_ps(m[0]);
     __m256 m1 = _mm256_castsi256_ps(m[1]);
@@ -648,7 +651,7 @@ thread_local bool lane_cache_initialized = false;
 
 // Append unique values from 'new_vals' to output, deduplicating against 'old' (previous 8 values)
 // Uses Lemire's SIMD dedup algorithm
-inline size_t append_unique_vals_simd(
+FORCE_INLINE size_t append_unique_vals_simd(
     u32x8 old_vals,
     u32x8 new_vals,
     uint32_t* out,

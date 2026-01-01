@@ -15,6 +15,11 @@
 #include <cstring>
 #include <cassert>
 
+// Force inline for hot path functions
+#ifndef FORCE_INLINE
+#define FORCE_INLINE __attribute__((always_inline)) inline
+#endif
+
 namespace packed_seq {
 
 // Type aliases matching Rust's wide crate
@@ -251,7 +256,7 @@ inline void simd_iter_load(SimdIterState& state) {
 
 // Get next 8 characters (one from each chunk) as u32x8
 // Each lane contains a 2-bit character value (0-3)
-inline u32x8 simd_iter_next(SimdIterState& state) {
+FORCE_INLINE u32x8 simd_iter_next(SimdIterState& state) {
     // Load new data every 16 characters
     if (state.buf_pos >= 16) {
         simd_iter_load(state);
@@ -270,7 +275,7 @@ inline u32x8 simd_iter_next(SimdIterState& state) {
 }
 
 // Check if iterator has more elements
-inline bool simd_iter_has_next(const SimdIterState& state) {
+FORCE_INLINE bool simd_iter_has_next(const SimdIterState& state) {
     return state.pos < state.par_len;
 }
 
