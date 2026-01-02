@@ -175,7 +175,7 @@ pub mod cpp {
     pub use crate::cpp_bindings::cpp_benchmark_sliding_min_simd;
     pub use crate::cpp_bindings::cpp_benchmark_packed_seq_simd;
     pub use crate::cpp_bindings::cpp_benchmark_nthash_packed_seq;
-    pub use crate::cpp_bindings::cpp_benchmark_fused_pipeline;
+    pub use crate::cpp_bindings::cpp_benchmark_hash_slidmin_only;
 }
 
 /// Re-exported internals. Used for benchmarking, and not part of the semver-compatible stable API.

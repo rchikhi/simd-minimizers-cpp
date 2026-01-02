@@ -48,28 +48,6 @@ static FORCE_INLINE u32x8 simd_rotr(u32x8 x) {
 // SIMD ntHash Implementation
 // =============================================================================
 
-struct NtHashSimdState {
-    u32x8 h_fw;
-    u32x8 h_rc;
-    u32x8 simd_f;
-    u32x8 simd_c;
-    u32x8 simd_f_rot;
-    u32x8 simd_c_rot;
-};
-
-// nthash_init is no longer needed - hash state is initialized inline in the pipeline functions
-// Keeping the struct definition for reference but removing the unused initializer
-
-static FORCE_INLINE u32x8 nthash_step(NtHashSimdState& state, u32x8 a, u32x8 r) {
-    u32x8 hfw_out = _mm256_xor_si256(simd_rotl(state.h_fw), table_lookup_avx2(state.simd_f, a));
-    state.h_fw = _mm256_xor_si256(hfw_out, table_lookup_avx2(state.simd_f_rot, r));
-
-    u32x8 hrc_out = _mm256_xor_si256(simd_rotr(state.h_rc), table_lookup_avx2(state.simd_c_rot, a));
-    state.h_rc = _mm256_xor_si256(hrc_out, table_lookup_avx2(state.simd_c, r));
-
-    return _mm256_add_epi32(hfw_out, hrc_out);
-}
-
 // Scalar ntHash with 4x loop unrolling (NOT true SIMD - use nthash with packed_seq for SIMD)
 std::vector<uint32_t> nthash_scalar_unrolled(
     const uint8_t* seq_data,
@@ -266,6 +244,10 @@ struct SlidingMinState {
     }
 
     FORCE_INLINE u32x8 process(u32x8 hash) {
+        // Prefetch next ring_buf slot for next iteration
+        size_t next_idx = (idx + 1 < w) ? idx + 1 : 0;
+        _mm_prefetch(reinterpret_cast<const char*>(&ring_buf[next_idx]), _MM_HINT_T0);
+
         // Simplified overflow check using scalar tracking (all lanes advance together)
         if (__builtin_expect(pos_scalar == max_pos_scalar, 0)) {
             pos = _mm256_sub_epi32(pos, delta);
@@ -350,6 +332,10 @@ struct SlidingLRMinState {
 
     // Process hash and return (left_min_pos, right_min_pos)
     FORCE_INLINE std::pair<u32x8, u32x8> process(u32x8 hash) {
+        // Prefetch next ring_buf slot for next iteration
+        size_t next_idx = (idx + 1 < w) ? idx + 1 : 0;
+        _mm_prefetch(reinterpret_cast<const char*>(&ring_buf[next_idx]), _MM_HINT_T0);
+
         // Simplified overflow check using scalar tracking (all lanes advance together)
         if (__builtin_expect(pos_scalar == max_pos_scalar, 0)) {
             pos = _mm256_sub_epi32(pos, delta);
@@ -693,7 +679,7 @@ void collect_and_dedup_positions(
     const std::vector<u32x8>& simd_positions,
     size_t num_valid_windows,
     std::vector<uint32_t>& out_positions,
-    uint32_t max_position = UINT32_MAX
+    [[maybe_unused]] uint32_t max_position = UINT32_MAX
 ) {
     if (simd_positions.empty()) return;
 
@@ -1156,7 +1142,7 @@ void minimizers_simd_fused_packed(
         u32x8 add = simd_iter_next(state);
         u32x8 remove;
 
-        if (iter_count < k - 1) {
+        if (__builtin_expect(iter_count < k - 1, 0)) {
             remove = _mm256_setzero_si256();
         } else {
             remove = delay_buf[read_idx];
@@ -1167,17 +1153,16 @@ void minimizers_simd_fused_packed(
         write_idx = (write_idx + 1) & buf_mask;
         iter_count++;
 
-        // Forward-only ntHash (non-canonical)
+        // Forward-only ntHash
         u32x8 hfw_out = _mm256_xor_si256(simd_rotl(h_fw), table_lookup_avx2(simd_f, add));
         h_fw = _mm256_xor_si256(hfw_out, table_lookup_avx2(simd_f_rot, remove));
-        u32x8 hash = hfw_out;  // Non-canonical: just use forward hash
+        u32x8 hash = hfw_out;
 
-        // Left-only sliding min
+        // Sliding min
         u32x8 min_pos = sliding_min.process(hash);
-
         output_count++;
 
-        if (output_count > l - 1) {
+        if (__builtin_expect(output_count > l - 1, 1)) {
             m[batch_count % 8] = min_pos;
             batch_count++;
 
@@ -2421,6 +2406,8 @@ extern "C" uint64_t benchmark_lane_resize_isolated(uint32_t iterations) {
     }
 
     auto end = Clock::now();
+    // Use sink to prevent it being optimized away
+    if (sink == 0) return 0;  // Never happens but prevents warning
     return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 

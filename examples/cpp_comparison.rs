@@ -9,7 +9,7 @@ use seq_hash::{KmerHasher, NtHasher};
 use simd_minimizers::cpp::{
     cpp_benchmark_nthash_simd, cpp_benchmark_sliding_min_scalar,
     cpp_benchmark_sliding_min_simd, cpp_benchmark_packed_seq_simd,
-    cpp_benchmark_nthash_packed_seq, cpp_benchmark_fused_pipeline,
+    cpp_benchmark_nthash_packed_seq, cpp_benchmark_hash_slidmin_only,
     cpp_benchmark_noncanonical_full, cpp_benchmark_canonical_full_direct,
     cpp_benchmark_canonical_phases, cpp_canonical_minimizer_positions,
 };
@@ -102,9 +102,9 @@ fn main() {
     let cpp_nthash_packed_us = cpp_benchmark_nthash_packed_seq(&seq_data, k, iterations);
     let cpp_nthash_packed_time = Duration::from_micros(cpp_nthash_packed_us / iterations as u64);
 
-    // C++ fused pipeline: ntHash + streaming sliding min
-    let cpp_fused_us = cpp_benchmark_fused_pipeline(&seq_data, k, w, iterations);
-    let cpp_fused_time = Duration::from_micros(cpp_fused_us / iterations as u64);
+    // C++ hash + sliding min only (NO collection/dedup - not comparable to FULL)
+    let cpp_hash_slidmin_us = cpp_benchmark_hash_slidmin_only(&seq_data, k, w, iterations);
+    let cpp_hash_slidmin_time = Duration::from_micros(cpp_hash_slidmin_us / iterations as u64);
 
     // C++ non-canonical FULL pipeline (for comparison with canonical)
     let cpp_noncanonical_full_us = cpp_benchmark_noncanonical_full(&seq_data, k, w, iterations);
@@ -134,9 +134,9 @@ fn main() {
     println!("C++ sliding min (SIMD)    | {:9.2} | {:7.1}",
         cpp_sliding_min_simd_time.as_secs_f64() * 1000.0,
         mb / cpp_sliding_min_simd_time.as_secs_f64());
-    println!("C++ fused (hash+slidmin)  | {:9.2} | {:7.1}",
-        cpp_fused_time.as_secs_f64() * 1000.0,
-        mb / cpp_fused_time.as_secs_f64());
+    println!("C++ hash+min (no collect) | {:9.2} | {:7.1}",
+        cpp_hash_slidmin_time.as_secs_f64() * 1000.0,
+        mb / cpp_hash_slidmin_time.as_secs_f64());
     println!("--------------------------|-----------|--------");
     println!("Rust FULL canonical       | {:9.2} | {:7.1}",
         rust_full_simd_time.as_secs_f64() * 1000.0,

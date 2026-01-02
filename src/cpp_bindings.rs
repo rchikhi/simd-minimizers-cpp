@@ -352,7 +352,7 @@ pub fn cpp_benchmark_nthash_packed_seq(ascii_seq: &[u8], k: usize, iterations: u
     }
 }
 
-pub fn cpp_benchmark_fused_pipeline(ascii_seq: &[u8], k: usize, w: usize, iterations: usize) -> u64 {
+pub fn cpp_benchmark_hash_slidmin_only(ascii_seq: &[u8], k: usize, w: usize, iterations: usize) -> u64 {
     unsafe {
         benchmark_hash_and_slidmin_only(
             ascii_seq.as_ptr(),
