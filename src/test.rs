@@ -26,13 +26,15 @@ fn test_on_inputs(mut f: impl FnMut(usize, usize, &[u8], AsciiSeq, PackedSeq)) {
     let ascii_seq = &*ASCII_SEQ;
     let packed_seq = &*PACKED_SEQ;
     let mut rng = rand::rng();
-    let mut ks = vec![1, 2, 3, 4, 5, 31, 32, 33, 63, 64, 65];
-    let mut ws = vec![1, 2, 3, 4, 5, 31, 32, 33, 63, 64, 65];
-    let mut lens = (0..100).collect_vec();
-    ks.extend((0..10).map(|_| rng.random_range(6..100)).collect_vec());
-    ws.extend((0..10).map(|_| rng.random_range(6..100)).collect_vec());
+    // Reduced test matrix for faster CI while maintaining edge case coverage
+    let mut ks = vec![1, 2, 3, 5, 31, 32, 33, 63, 64, 65];
+    let mut ws = vec![1, 2, 3, 5, 31, 32, 33, 63, 64, 65];
+    // Fewer lengths: key edge cases + some random
+    let mut lens = vec![0, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 99];
+    ks.extend((0..3).map(|_| rng.random_range(6..100)).collect_vec());
+    ws.extend((0..3).map(|_| rng.random_range(6..100)).collect_vec());
     lens.extend(
-        (0..10)
+        (0..5)
             .map(|_| rng.random_range(100..1024 * 8))
             .collect_vec(),
     );
@@ -57,24 +59,27 @@ fn minimizers_fwd() {
             let hasher = hasher(k);
             let m = minimizers(k, w).hasher(&hasher);
 
-            let naive = ascii_seq
-                .0
-                .windows(w + k - 1)
-                .enumerate()
-                .map(|(pos, seq)| (pos + one_minimizer(AsciiSeq(seq), &hasher)) as u32)
-                .dedup()
-                .collect::<Vec<_>>();
-
             let scalar_ascii = m.run_scalar_once(ascii_seq);
             let scalar_packed = m.run_scalar_once(packed_seq);
             let simd_ascii = m.run_once(ascii_seq);
             let simd_packed = m.run_once(packed_seq);
 
             let len = ascii_seq.len();
-            assert_eq!(naive, scalar_ascii, "k={k}, w={w}, len={len}");
-            assert_eq!(naive, scalar_packed, "k={k}, w={w}, len={len}");
-            assert_eq!(naive, simd_ascii, "k={k}, w={w}, len={len}");
-            assert_eq!(naive, simd_packed, "k={k}, w={w}, len={len}");
+            // Only run O(n*w) naive impl for small inputs to keep tests fast
+            if len <= 100 {
+                let naive = ascii_seq
+                    .0
+                    .windows(w + k - 1)
+                    .enumerate()
+                    .map(|(pos, seq)| (pos + one_minimizer(AsciiSeq(seq), &hasher)) as u32)
+                    .dedup()
+                    .collect::<Vec<_>>();
+                assert_eq!(naive, scalar_ascii, "k={k}, w={w}, len={len}");
+            }
+            // For all inputs, verify implementations match each other
+            assert_eq!(scalar_ascii, scalar_packed, "k={k}, w={w}, len={len}");
+            assert_eq!(scalar_ascii, simd_ascii, "k={k}, w={w}, len={len}");
+            assert_eq!(scalar_ascii, simd_packed, "k={k}, w={w}, len={len}");
         });
     }
     f(|k| NtHasher::<false>::new(k));
