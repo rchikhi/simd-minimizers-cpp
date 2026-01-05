@@ -1,31 +1,11 @@
-//! Bindings for the C++ implementation of canonical_minimizers_seq_simd_avx2
+//! FFI bindings for the C++ SIMD minimizers implementation.
 //!
-//! This module provides a safe Rust interface to the C++ implementation.
+//! Uses zero-copy FFI pattern: writes directly to pre-allocated buffers.
 #![allow(dead_code)]
 
 use std::os::raw::{c_uchar, c_uint};
 
 unsafe extern "C" {
-    /// C++ function to compute canonical minimizers
-    fn canonical_minimizers_seq_simd_avx2(
-        seq_data: *const c_uchar,
-        seq_len: c_uint,
-        k: c_uint,
-        w: c_uint,
-        out_ptr: *mut *mut c_uint,
-        out_len: *mut c_uint,
-    );
-
-    /// C++ function to compute non-canonical minimizers (packs per call = true e2e)
-    fn noncanonical_minimizers_simd_avx2(
-        seq_data: *const c_uchar,
-        seq_len: c_uint,
-        k: c_uint,
-        w: c_uint,
-        out_ptr: *mut *mut c_uint,
-        out_len: *mut c_uint,
-    );
-
     /// Zero-copy: writes directly to provided buffer (avoids malloc + double copy)
     fn noncanonical_minimizers_to_buffer(
         seq_data: *const c_uchar,
@@ -195,19 +175,6 @@ unsafe extern "C" {
         init_us: *mut u64,
         main_loop_us: *mut u64,
         collection_us: *mut u64,
-    );
-
-    /// Free minimizers buffer allocated by C++
-    fn free_minimizers(ptr: *mut c_uint);
-
-    /// Compute syncmers using C++ SIMD
-    fn syncmers_simd_avx2(
-        ascii_seq: *const c_uchar,
-        seq_len: c_uint,
-        k: c_uint,
-        m: c_uint,
-        out_ptr: *mut *mut c_uint,
-        out_len: *mut c_uint,
     );
 
     /// Pack ASCII sequence to 2-bit format and return packed bytes

@@ -772,195 +772,6 @@ void collect_and_dedup_positions(
 }
 
 // =============================================================================
-// SIMD Canonical Minimizers - Full pipeline matching Rust implementation
-// =============================================================================
-
-void canonical_minimizers_simd_packed_seq(
-    const packed_seq::PackedSeq& seq,
-    uint32_t k,
-    uint32_t w,
-    std::vector<u32x8>& out_positions
-) {
-    using namespace packed_seq;
-
-    const uint32_t l = k + w - 1;
-    if (seq.len() < l) return;
-    if (l % 2 == 0) return;  // l must be odd for canonical
-
-    // Initialize hash constants for canonical ntHash
-    const uint32_t rot = (k - 1) * ROT;
-    alignas(32) uint32_t f_table[8], c_table[8], f_rot_table[8], c_rot_table[8];
-    for (int i = 0; i < 4; i++) {
-        f_table[i] = f_table[i+4] = HASHES_F[i];
-        c_table[i] = c_table[i+4] = HASHES_F[complement_base(i)];
-        f_rot_table[i] = f_rot_table[i+4] = rotl32(HASHES_F[i], rot);
-        c_rot_table[i] = c_rot_table[i+4] = rotl32(HASHES_F[complement_base(i)], rot);
-    }
-
-    u32x8 simd_f = _mm256_load_si256(reinterpret_cast<const __m256i*>(f_table));
-    u32x8 simd_c = _mm256_load_si256(reinterpret_cast<const __m256i*>(c_table));
-    u32x8 simd_f_rot = _mm256_load_si256(reinterpret_cast<const __m256i*>(f_rot_table));
-    u32x8 simd_c_rot = _mm256_load_si256(reinterpret_cast<const __m256i*>(c_rot_table));
-
-    // Use simple delay buffers (power of 2 size) like the working minimizers_simd_packed_seq
-    size_t buf_size_k = 1;
-    while (buf_size_k < k) buf_size_k *= 2;
-    size_t buf_mask_k = buf_size_k - 1;
-
-    size_t buf_size_l = 1;
-    while (buf_size_l < l + 1) buf_size_l *= 2;  // Note: delay is l, so need l+1 slots
-    size_t buf_mask_l = buf_size_l - 1;
-
-    alignas(32) u32x8 delay_buf_k[64];
-    alignas(32) u32x8 delay_buf_l[128];  // May need more for larger l
-    for (size_t i = 0; i < buf_size_k; i++) delay_buf_k[i] = _mm256_setzero_si256();
-    for (size_t i = 0; i < buf_size_l; i++) delay_buf_l[i] = _mm256_setzero_si256();
-
-    // Initialize iterator
-    SimdIterState state = simd_iter_init(seq, l);
-    size_t chunk_size = state.chunk_size;
-
-    // Initialize components
-    SlidingLRMinState sliding_min(w, chunk_size, k, 0);
-    CanonicalMapper canonical_mapper(k, w);
-
-    // Pre-warm hash state with k-1 zeros (matching Rust's nthash_mapper)
-    uint32_t fw_init = 0, rc_init = 0;
-    for (uint32_t i = 0; i < k - 1; i++) {
-        fw_init = rotl32(fw_init, ROT) ^ HASHES_F[0];
-        rc_init = rotr32(rc_init, ROT) ^ c_rot_table[0];
-    }
-    u32x8 h_fw = _mm256_set1_epi32(fw_init);
-    u32x8 h_rc = _mm256_set1_epi32(rc_init);
-
-    size_t write_idx_k = 0, read_idx_k = 0;
-    size_t write_idx_l = 0, read_idx_l = 0;
-    size_t iter_count = 0;
-    size_t output_count = 0;
-
-    // Main loop - process all iterations
-    while (simd_iter_has_next(state)) {
-        u32x8 add = simd_iter_next(state);
-        u32x8 remove_k, remove_l;
-
-        // Get delayed character for ntHash (delay = k-1)
-        if (iter_count < k - 1) {
-            remove_k = _mm256_setzero_si256();
-        } else {
-            remove_k = delay_buf_k[read_idx_k];
-            read_idx_k = (read_idx_k + 1) & buf_mask_k;
-        }
-
-        // Get delayed character for canonical (delay = l-1, matching Rust's Delay(l-1))
-        if (iter_count < l - 1) {
-            remove_l = _mm256_setzero_si256();
-        } else {
-            remove_l = delay_buf_l[read_idx_l];
-            read_idx_l = (read_idx_l + 1) & buf_mask_l;
-        }
-
-        // Store current character in delay buffers
-        delay_buf_k[write_idx_k] = add;
-        write_idx_k = (write_idx_k + 1) & buf_mask_k;
-        delay_buf_l[write_idx_l] = add;
-        write_idx_l = (write_idx_l + 1) & buf_mask_l;
-
-        iter_count++;
-
-        // Compute canonical ntHash
-        u32x8 hfw_out = _mm256_xor_si256(simd_rotl(h_fw), table_lookup_avx2(simd_f, add));
-        h_fw = _mm256_xor_si256(hfw_out, table_lookup_avx2(simd_f_rot, remove_k));
-
-        u32x8 hrc_out = _mm256_xor_si256(simd_rotr(h_rc), table_lookup_avx2(simd_c_rot, add));
-        h_rc = _mm256_xor_si256(hrc_out, table_lookup_avx2(simd_c, remove_k));
-
-        u32x8 hash = _mm256_add_epi32(hfw_out, hrc_out);
-
-        // Compute canonical mask
-        i32x8 canonical_mask = canonical_mapper.process(add, remove_l);
-
-        // Compute both left and right minimums
-        auto [lmin_pos, rmin_pos] = sliding_min.process(hash);
-
-        // Blend: select lmin where canonical, rmin otherwise
-        u32x8 selected_pos = simd_blend(canonical_mask, lmin_pos, rmin_pos);
-
-        output_count++;
-
-        // Skip first l-1 outputs (warmup)
-        if (output_count > l - 1) {
-            out_positions.push_back(selected_pos);
-        }
-    }
-}
-
-void canonical_minimizers_simd_collected(
-    const uint8_t* ascii_seq,
-    uint32_t seq_len,
-    uint32_t k,
-    uint32_t w,
-    std::vector<uint32_t>& out_positions
-) {
-    using namespace packed_seq;
-
-    const uint32_t l = k + w - 1;
-    if (seq_len < l) return;
-    if (l % 2 == 0) return;
-
-    PackedSeq seq = PackedSeq::from_ascii(ascii_seq, seq_len);
-    std::vector<u32x8> simd_positions;
-    simd_positions.reserve((seq_len - l + 1) / 8 + 1);
-
-    canonical_minimizers_simd_packed_seq(seq, k, w, simd_positions);
-
-    SimdIterState state = simd_iter_init(seq, l);
-    size_t chunk_size = state.chunk_size;
-    size_t num_valid_windows = seq_len - l + 1;
-    // max_position should be the number of valid k-mer positions (not windows)
-    // k-mers are valid at positions 0 to seq_len - k, so max_position = seq_len - k + 1
-    uint32_t max_position = seq_len - k + 1;
-
-    collect_and_dedup_positions(simd_positions, num_valid_windows, out_positions, max_position);
-
-    // Process tail: windows that don't fit into the 8 SIMD chunks
-    // The SIMD part covers windows at positions [0, 8 * chunk_size)
-    // The tail covers windows at positions [8 * chunk_size, num_valid_windows)
-    // Matching Rust: tail positions are offset by 8 * head_len where head_len = simd_positions.size()
-    size_t simd_coverage = 8 * chunk_size;
-    size_t head_len = simd_positions.size();
-    size_t tail_offset = 8 * head_len;  // Position offset for tail
-
-    if (simd_coverage < seq_len && simd_coverage >= l - 1) {
-        // The tail sequence starts at position 8 * chunk_size
-        // Process using scalar canonical minimizers
-        const uint8_t* tail_seq = ascii_seq + simd_coverage;
-        size_t tail_len = seq_len - simd_coverage;
-
-        if (tail_len >= l) {
-            // Convert tail to packed seq for scalar processing
-            std::vector<uint8_t> tail_packed;
-            for (size_t i = 0; i < tail_len; i++) {
-                tail_packed.push_back(pack_char(tail_seq[i]));
-            }
-
-            // Call scalar implementation
-            std::vector<uint32_t> tail_positions;
-            canonical_minimizers_seq_scalar(tail_packed.data(), 0, tail_len, k, w, tail_positions);
-
-            // Append tail positions with offset and dedup against existing
-            for (uint32_t pos : tail_positions) {
-                uint32_t adjusted_pos = pos + (uint32_t)tail_offset;
-                if (adjusted_pos < max_position) {
-                    if (out_positions.empty() || out_positions.back() != adjusted_pos) {
-                        out_positions.push_back(adjusted_pos);
-                    }
-                }
-            }
-        }
-    }
-}
-
-// =============================================================================
 // FUSED SIMD Pipeline - Collection/dedup inline with main loop
 // =============================================================================
 
@@ -1190,7 +1001,7 @@ FORCE_INLINE size_t append_filtered_vals_simd(
 // Syncmer computation - inline check during batch processing
 // For each window, checks if minimizer is at prefix (pos 0) or suffix (pos w-1)
 // =============================================================================
-void syncmers_simd_fused_v2(
+void syncmers_simd_fused(
     const packed_seq::PackedSeq& seq,
     uint32_t seq_len,
     uint32_t k,      // syncmer k-mer size
@@ -1382,7 +1193,7 @@ void syncmers_simd_fused_v2(
 }
 
 // =============================================================================
-// Timing struct for profiling (used by profile_collection_phases and benchmark_canonical_phases)
+// Timing struct for profiling (used by benchmark_canonical_phases)
 // =============================================================================
 struct FusedPhaseTiming {
     uint64_t init_us = 0;           // Hash table + delay buffer + iterator setup
@@ -1689,199 +1500,6 @@ void canonical_minimizers_simd_fused_packed(
     canonical_minimizers_simd_fused_impl<false>(seq, seq_len, k, w, out_positions, nullptr);
 }
 
-// ASCII wrapper that calls the packed version (original interface for FFI)
-void canonical_minimizers_simd_fused(
-    const uint8_t* ascii_seq,
-    uint32_t seq_len,
-    uint32_t k,
-    uint32_t w,
-    std::vector<uint32_t>& out_positions
-) {
-    using namespace packed_seq;
-    PackedSeq seq = PackedSeq::from_ascii(ascii_seq, seq_len);
-    canonical_minimizers_simd_fused_packed(seq, seq_len, k, w, out_positions);
-}
-
-// =============================================================================
-// PROFILING: Time each phase of the collection separately
-// =============================================================================
-extern "C" void profile_collection_phases(
-    const uint8_t* ascii_seq, uint32_t seq_len, uint32_t k, uint32_t w, uint32_t iterations,
-    uint64_t* main_loop_us, uint64_t* partial_batch_us, uint64_t* truncate_us,
-    uint64_t* prereserve_us, uint64_t* flatten_us, uint64_t* tail_us
-) {
-    using namespace packed_seq;
-    using Clock = std::chrono::high_resolution_clock;
-
-    const uint32_t l = k + w - 1;
-    if (seq_len < l) return;
-
-    // Pack sequence once (outside timing loop)
-    PackedSeq seq_packed = PackedSeq::from_ascii(ascii_seq, seq_len);
-
-    // Accumulate timing across iterations
-    FusedPhaseTiming total_timing;
-    uint64_t total_tail = 0;
-
-    for (uint32_t iter = 0; iter < iterations; iter++) {
-        std::vector<uint32_t> out_positions;
-        FusedPhaseTiming iter_timing;
-
-        // Call the template with profiling enabled
-        canonical_minimizers_simd_fused_impl<true>(seq_packed, seq_len, k, w, out_positions, &iter_timing);
-
-        // Accumulate phase timings
-        total_timing.main_loop_us += iter_timing.main_loop_us;
-        total_timing.partial_batch_us += iter_timing.partial_batch_us;
-        total_timing.truncate_us += iter_timing.truncate_us;
-        total_timing.prereserve_us += iter_timing.prereserve_us;
-        total_timing.flatten_us += iter_timing.flatten_us;
-
-        // === PHASE 6: TAIL (timed separately) ===
-        auto t_tail_start = Clock::now();
-
-        // Compute chunk_size for tail offset calculation
-        size_t num_kmers = seq_len - l + 1;
-        size_t div_ceil_8 = (num_kmers + 7) / 8;
-        size_t chunk_size = ((div_ceil_8 + 3) / 4) * 4;
-        size_t simd_coverage = 8 * chunk_size;
-
-        if (simd_coverage < seq_len) {
-            const uint8_t* tail_seq = ascii_seq + simd_coverage;
-            size_t tail_len = seq_len - simd_coverage;
-
-            if (tail_len >= l) {
-                std::vector<uint8_t> tail_packed_data;
-                for (size_t i = 0; i < tail_len; i++) {
-                    tail_packed_data.push_back(pack_char(tail_seq[i]));
-                }
-
-                std::vector<uint32_t> tail_positions;
-                canonical_minimizers_seq_scalar(tail_packed_data.data(), 0, tail_len, k, w, tail_positions);
-
-                uint32_t max_position = seq_len - k + 1;
-                for (uint32_t pos : tail_positions) {
-                    uint32_t adjusted_pos = pos + (uint32_t)simd_coverage;
-                    if (adjusted_pos < max_position) {
-                        if (out_positions.empty() || out_positions.back() != adjusted_pos) {
-                            out_positions.push_back(adjusted_pos);
-                        }
-                    }
-                }
-            }
-        }
-
-        auto t_tail_end = Clock::now();
-        total_tail += std::chrono::duration_cast<std::chrono::microseconds>(t_tail_end - t_tail_start).count();
-    }
-
-    *main_loop_us = total_timing.main_loop_us;
-    *partial_batch_us = total_timing.partial_batch_us;
-    *truncate_us = total_timing.truncate_us;
-    *prereserve_us = total_timing.prereserve_us;
-    *flatten_us = total_timing.flatten_us;
-    *tail_us = total_tail;
-}
-
-// =============================================================================
-// Main Entry Point - Now uses SIMD canonical minimizers
-// =============================================================================
-
-extern "C" void canonical_minimizers_seq_simd_avx2(
-    const uint8_t* seq_data,
-    uint32_t seq_len,
-    uint32_t k,
-    uint32_t w,
-    uint32_t** out_ptr,
-    uint32_t* out_len
-) {
-    try {
-        if (seq_len == 0) {
-            *out_ptr = nullptr;
-            *out_len = 0;
-            return;
-        }
-
-        if ((k + w - 1) % 2 == 0) {
-            *out_ptr = nullptr;
-            *out_len = 0;
-            return;
-        }
-
-        std::vector<uint32_t> minimizers;
-        minimizers.reserve((seq_len - k + 1) / w);
-
-        // For short sequences, use scalar implementation for correctness
-        // SIMD requires longer sequences to work correctly with 8-way parallelism
-        const uint32_t l = k + w - 1;
-        if (seq_len < l + 64) {  // Use scalar for sequences < 64 bases beyond minimum
-            canonical_minimizers_seq_scalar(seq_data, 0, seq_len, k, w, minimizers);
-        } else {
-            // Use fused canonical pipeline (hash + sliding min streamed together)
-            canonical_minimizers_simd_fused(seq_data, seq_len, k, w, minimizers);
-        }
-
-        *out_len = minimizers.size();
-        if (*out_len > 0) {
-            *out_ptr = (uint32_t*)malloc(*out_len * sizeof(uint32_t));
-            if (*out_ptr == nullptr) {
-                *out_len = 0;
-                return;
-            }
-            memcpy(*out_ptr, minimizers.data(), *out_len * sizeof(uint32_t));
-        } else {
-            *out_ptr = nullptr;
-        }
-    } catch (...) {
-        *out_ptr = nullptr;
-        *out_len = 0;
-    }
-}
-
-extern "C" void free_minimizers(uint32_t* ptr) {
-    if (ptr) free(ptr);
-}
-
-// FFI wrapper for non-canonical minimizers (packs per call = true e2e)
-extern "C" void noncanonical_minimizers_simd_avx2(
-    const uint8_t* seq_data,
-    uint32_t seq_len,
-    uint32_t k,
-    uint32_t w,
-    uint32_t** out_ptr,
-    uint32_t* out_len
-) {
-    try {
-        if (seq_len == 0) {
-            *out_ptr = nullptr;
-            *out_len = 0;
-            return;
-        }
-
-        std::vector<uint32_t> minimizers;
-        minimizers.reserve((seq_len - k + 1) / w);
-
-        // Pack ASCII to 2-bit and use fused pipeline
-        auto seq = packed_seq::PackedSeq::from_ascii(seq_data, seq_len);
-        minimizers_simd_fused_packed(seq, seq_len, k, w, minimizers);
-
-        *out_len = minimizers.size();
-        if (*out_len > 0) {
-            *out_ptr = (uint32_t*)malloc(*out_len * sizeof(uint32_t));
-            if (*out_ptr == nullptr) {
-                *out_len = 0;
-                return;
-            }
-            memcpy(*out_ptr, minimizers.data(), *out_len * sizeof(uint32_t));
-        } else {
-            *out_ptr = nullptr;
-        }
-    } catch (...) {
-        *out_ptr = nullptr;
-        *out_len = 0;
-    }
-}
-
 // Zero-copy FFI: writes directly to provided buffer (avoids malloc + double copy)
 // Uses thread-local storage to avoid repeated allocation of packed buffer
 // Returns number of positions written, or 0 if buffer too small
@@ -1959,7 +1577,7 @@ extern "C" uint32_t syncmers_to_buffer(
     positions.clear();
     positions.reserve(std::min(out_capacity, seq_len / (k - m + 1)));
 
-    syncmers_simd_fused_v2(seq, seq_len, k, m, positions);
+    syncmers_simd_fused(seq, seq_len, k, m, positions);
 
     uint32_t count = std::min((uint32_t)positions.size(), out_capacity);
     memcpy(out_buf, positions.data(), count * sizeof(uint32_t));
@@ -2439,36 +2057,8 @@ extern "C" uint32_t get_cpp_forward_hashes(
 }
 
 // =============================================================================
-// ISOLATED MICROBENCHMARKS FOR COLLECTION COMPONENTS
-// These measure individual operations in isolation to identify bottlenecks
+// ISOLATED MICROBENCHMARKS FOR DEDUP
 // =============================================================================
-
-// Benchmark transpose_8x8 in isolation
-// Returns total time in microseconds for 'iterations' transpose operations
-extern "C" uint64_t benchmark_transpose_isolated(uint32_t iterations) {
-    using Clock = std::chrono::high_resolution_clock;
-
-    // Initialize test data with realistic values
-    alignas(32) u32x8 m[8];
-    alignas(32) u32x8 t[8];
-    for (int i = 0; i < 8; i++) {
-        m[i] = _mm256_set_epi32(i*8+7, i*8+6, i*8+5, i*8+4, i*8+3, i*8+2, i*8+1, i*8+0);
-    }
-
-    auto start = Clock::now();
-
-    volatile uint32_t sink = 0;
-    for (uint32_t iter = 0; iter < iterations; iter++) {
-        transpose_8x8(m, t);
-        // Prevent optimization by using result
-        sink += _mm256_extract_epi32(t[0], 0);
-        // Feed back to prevent loop unrolling optimizations
-        m[0] = _mm256_add_epi32(m[0], _mm256_set1_epi32(1));
-    }
-
-    auto end = Clock::now();
-    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-}
 
 // Benchmark append_unique_vals_simd in isolation
 // Returns total time in microseconds for 'iterations' dedup operations
@@ -2523,132 +2113,6 @@ extern "C" uint64_t benchmark_dedup_scalar_isolated(uint32_t iterations) {
     return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
-// Benchmark 8x dedup calls (one batch) to simulate actual collection pattern
-// Returns total time in microseconds for 'iterations' batches (each batch = 8 dedup calls)
-extern "C" uint64_t benchmark_dedup_batch_isolated(uint32_t iterations) {
-    using Clock = std::chrono::high_resolution_clock;
-
-    // 8 lane caches like in real collection
-    std::vector<uint32_t> lane_caches[8];
-    for (int i = 0; i < 8; i++) {
-        lane_caches[i].resize(iterations * 8 + 64);
-    }
-    size_t write_idx[8] = {0};
-
-    // Previous values per lane
-    alignas(32) u32x8 old_vals[8];
-    for (int i = 0; i < 8; i++) {
-        old_vals[i] = _mm256_set1_epi32(UINT32_MAX);
-    }
-
-    // Transposed result (simulated)
-    alignas(32) u32x8 t[8];
-    for (int i = 0; i < 8; i++) {
-        t[i] = _mm256_set_epi32(i*8+7, i*8+6, i*8+5, i*8+4, i*8+3, i*8+2, i*8+1, i*8+0);
-    }
-
-    auto start = Clock::now();
-
-    for (uint32_t iter = 0; iter < iterations; iter++) {
-        // Simulate 8 dedup calls per batch
-        for (int j = 0; j < 8; j++) {
-            write_idx[j] = append_unique_vals_simd(old_vals[j], t[j], lane_caches[j].data(), write_idx[j]);
-            old_vals[j] = t[j];
-        }
-
-        // Vary values and reset periodically
-        t[0] = _mm256_add_epi32(t[0], _mm256_set1_epi32(1));
-        if (write_idx[0] > iterations * 4) {
-            for (int j = 0; j < 8; j++) write_idx[j] = 0;
-        }
-    }
-
-    auto end = Clock::now();
-    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-}
-
-// Benchmark lane cache resize check pattern
-// Returns total time in microseconds for 'iterations' resize checks
-extern "C" uint64_t benchmark_lane_resize_isolated(uint32_t iterations) {
-    using Clock = std::chrono::high_resolution_clock;
-
-    std::vector<uint32_t> lane_cache;
-    lane_cache.reserve(8192);  // Start with realistic initial capacity
-
-    auto start = Clock::now();
-
-    volatile size_t sink = 0;
-    size_t write_idx = 0;
-    for (uint32_t iter = 0; iter < iterations; iter++) {
-        // This is the pattern used in collection
-        if (write_idx + 8 > lane_cache.size()) {
-            lane_cache.resize(lane_cache.size() + 1024);
-        }
-        // Simulate write
-        write_idx += 4;  // Typical unique count
-        sink = write_idx;
-
-        // Occasionally reset to vary the pattern
-        if (iter % 1000 == 999) {
-            lane_cache.resize(0);
-            lane_cache.reserve(8192);
-            write_idx = 0;
-        }
-    }
-
-    auto end = Clock::now();
-    // Use sink to prevent it being optimized away
-    if (sink == 0) return 0;  // Never happens but prevents warning
-    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-}
-
-// Combined benchmark: transpose + 8x dedup (full collection batch)
-// Returns total time in microseconds for 'iterations' complete batches
-extern "C" uint64_t benchmark_collection_batch_isolated(uint32_t iterations) {
-    using Clock = std::chrono::high_resolution_clock;
-
-    // 8 lane caches
-    std::vector<uint32_t> lane_caches[8];
-    for (int i = 0; i < 8; i++) {
-        lane_caches[i].resize(iterations * 8 + 64);
-    }
-    size_t write_idx[8] = {0};
-
-    alignas(32) u32x8 old_vals[8];
-    for (int i = 0; i < 8; i++) {
-        old_vals[i] = _mm256_set1_epi32(UINT32_MAX);
-    }
-
-    // Input matrix (8 u32x8 values to transpose)
-    alignas(32) u32x8 m[8];
-    alignas(32) u32x8 t[8];
-    for (int i = 0; i < 8; i++) {
-        m[i] = _mm256_set_epi32(i*8+7, i*8+6, i*8+5, i*8+4, i*8+3, i*8+2, i*8+1, i*8+0);
-    }
-
-    auto start = Clock::now();
-
-    for (uint32_t iter = 0; iter < iterations; iter++) {
-        // Step 1: Transpose
-        transpose_8x8(m, t);
-
-        // Step 2: 8x Dedup
-        for (int j = 0; j < 8; j++) {
-            write_idx[j] = append_unique_vals_simd(old_vals[j], t[j], lane_caches[j].data(), write_idx[j]);
-            old_vals[j] = t[j];
-        }
-
-        // Vary values
-        m[0] = _mm256_add_epi32(m[0], _mm256_set1_epi32(1));
-        if (write_idx[0] > iterations * 4) {
-            for (int j = 0; j < 8; j++) write_idx[j] = 0;
-        }
-    }
-
-    auto end = Clock::now();
-    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-}
-
 // =============================================================================
 // Benchmark syncmers DIRECTLY (like benchmark_noncanonical_full)
 // Pre-packs sequence OUTSIDE timing loop for fair comparison
@@ -2676,7 +2140,7 @@ extern "C" uint64_t benchmark_syncmers_direct(
 
     for (uint32_t iter = 0; iter < iterations; iter++) {
         positions.clear();
-        syncmers_simd_fused_v2(seq_packed, seq_len, k, m, positions);
+        syncmers_simd_fused(seq_packed, seq_len, k, m, positions);
 
         if (!positions.empty()) {
             result_sum += positions[0];
@@ -2685,37 +2149,6 @@ extern "C" uint64_t benchmark_syncmers_direct(
 
     auto end = std::chrono::high_resolution_clock::now();
     return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-}
-
-// =============================================================================
-// FFI wrapper for syncmers
-// =============================================================================
-
-extern "C" void syncmers_simd_avx2(
-    const uint8_t* ascii_seq,
-    uint32_t seq_len,
-    uint32_t k,      // syncmer k-mer size
-    uint32_t m,      // minimizer size (s-mer)
-    uint32_t** out_ptr,
-    uint32_t* out_len
-) {
-    // Pack the ASCII sequence
-    auto packed = packed_seq::PackedSeq::from_ascii(ascii_seq, seq_len);
-
-    // Compute syncmers using optimized fused SIMD implementation
-    std::vector<uint32_t> result;
-    result.reserve(seq_len / (k - m + 1));
-    syncmers_simd_fused_v2(packed, seq_len, k, m, result);
-
-    // Allocate output and copy
-    *out_len = static_cast<uint32_t>(result.size());
-    if (result.empty()) {
-        *out_ptr = nullptr;
-        return;
-    }
-
-    *out_ptr = static_cast<uint32_t*>(malloc(result.size() * sizeof(uint32_t)));
-    memcpy(*out_ptr, result.data(), result.size() * sizeof(uint32_t));
 }
 
 // =============================================================================
