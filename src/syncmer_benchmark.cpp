@@ -30,7 +30,7 @@ static std::vector<uint8_t> generate_random_dna(size_t len) {
 }
 
 // Forward declaration for SIMD syncmers
-extern void syncmers_simd_fused_v2(
+extern void syncmers_simd_fused_packed(
     const packed_seq::PackedSeq& seq,
     uint32_t seq_len,
     uint32_t k,      // syncmer k-mer size
@@ -127,7 +127,7 @@ int main(int argc, char** argv) {
 
         for (uint32_t iter = 0; iter < iterations; iter++) {
             syncmer_positions.clear();
-            syncmers_simd_fused_v2(seq_packed, seq_len, k, m, syncmer_positions);
+            syncmers_simd_fused_packed(seq_packed, seq_len, k, m, syncmer_positions);
             if (!syncmer_positions.empty()) result_sum += syncmer_positions[0];
         }
 
@@ -176,7 +176,7 @@ int main(int argc, char** argv) {
         auto start = std::chrono::high_resolution_clock::now();
         for (uint32_t iter = 0; iter < iterations; iter++) {
             syncmer_pos.clear();
-            syncmers_simd_fused_v2(seq_packed, seq_len, test_k, test_m, syncmer_pos);
+            syncmers_simd_fused_packed(seq_packed, seq_len, test_k, test_m, syncmer_pos);
         }
         auto end = std::chrono::high_resolution_clock::now();
         uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();

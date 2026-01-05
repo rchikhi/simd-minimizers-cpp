@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 use packed_seq::{PackedSeqVec, SeqVec};
 use simd_minimizers::cpp::{
     cpp_benchmark_packed_seq_simd, cpp_benchmark_nthash_packed_seq,
-    cpp_benchmark_noncanonical_full,
-    cpp_benchmark_canonical_full_direct, cpp_benchmark_canonical_phases,
+    cpp_benchmark_noncanonical,
+    cpp_benchmark_canonical, cpp_benchmark_canonical_phases,
     cpp_canonical_minimizer_positions, cpp_noncanonical_minimizer_positions,
-    cpp_benchmark_syncmers_direct,
+    cpp_benchmark_syncmers,
     cpp_benchmark_dedup_simd, cpp_benchmark_dedup_scalar,
 };
 
@@ -77,11 +77,11 @@ fn main() {
     let cpp_nthash_packed_time = Duration::from_micros(cpp_nthash_packed_us / iterations as u64);
 
     // C++ non-canonical pipeline (packing excluded from timing)
-    let cpp_noncanonical_prepacked_us = cpp_benchmark_noncanonical_full(&seq_data, k, w, iterations);
+    let cpp_noncanonical_prepacked_us = cpp_benchmark_noncanonical(&seq_data, k, w, iterations);
     let cpp_noncanonical_prepacked_time = Duration::from_micros(cpp_noncanonical_prepacked_us / iterations as u64);
 
-    // C++ canonical FULL pipeline DIRECT (no FFI result handling - just timing the core algorithm)
-    let cpp_canonical_direct_us = cpp_benchmark_canonical_full_direct(&seq_data, k, w, iterations);
+    // C++ canonical pipeline (no FFI result handling - just timing the core algorithm)
+    let cpp_canonical_direct_us = cpp_benchmark_canonical(&seq_data, k, w, iterations);
     let cpp_canonical_direct_time = Duration::from_micros(cpp_canonical_direct_us / iterations as u64);
 
     let mb = seq_len as f64 / 1_000_000.0;
@@ -142,7 +142,7 @@ fn main() {
     }, iterations);
 
     // C++ pre-packed: syncmers (for completeness)
-    let cpp_syncmers_prepacked_us = cpp_benchmark_syncmers_direct(&seq_data, syncmer_k, syncmer_m, iterations);
+    let cpp_syncmers_prepacked_us = cpp_benchmark_syncmers(&seq_data, syncmer_k, syncmer_m, iterations);
     let cpp_syncmers_prepacked_time = Duration::from_micros(cpp_syncmers_prepacked_us / iterations as u64);
 
     println!("End-to-End (ASCII → minimizers, packing INCLUDED):");

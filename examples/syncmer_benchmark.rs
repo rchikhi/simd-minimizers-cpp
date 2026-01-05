@@ -63,7 +63,7 @@ fn main() {
         let m = 11usize;
 
         // Use direct benchmark function (pre-packs sequence once, times only algorithm)
-        let cpp_us = simd_minimizers::cpp::cpp_benchmark_syncmers_direct(&seq_data, k, m, iterations);
+        let cpp_us = simd_minimizers::cpp::cpp_benchmark_syncmers(&seq_data, k, m, iterations);
         let cpp_time = std::time::Duration::from_micros(cpp_us / iterations as u64);
 
         let ms_per_iter = cpp_time.as_secs_f64() * 1000.0;
@@ -98,7 +98,7 @@ fn main() {
         let mut cpp_syncmers: Vec<u32> = Vec::new();
 
         // C++ benchmark (use direct function that pre-packs sequence)
-        let cpp_us = simd_minimizers::cpp::cpp_benchmark_syncmers_direct(&seq_data, test_k, test_m, iterations);
+        let cpp_us = simd_minimizers::cpp::cpp_benchmark_syncmers(&seq_data, test_k, test_m, iterations);
         let cpp_time = std::time::Duration::from_micros(cpp_us / iterations as u64);
         let cpp_throughput = (seq_len as f64 / 1_000_000.0) / cpp_time.as_secs_f64();
 

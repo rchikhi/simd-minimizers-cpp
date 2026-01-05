@@ -613,7 +613,7 @@ FORCE_INLINE size_t append_unique_vals_scalar(
 // FUSED SIMD Pipeline - Collection/dedup inline with main loop
 // =============================================================================
 
-// Non-canonical version with NEW inline collection (for fair benchmarking)
+// Non-canonical minimizers with inline collection
 void minimizers_simd_fused_packed(
     const packed_seq::PackedSeq& seq,
     uint32_t seq_len,
@@ -839,7 +839,7 @@ FORCE_INLINE size_t append_filtered_vals_simd(
 // Syncmer computation - inline check during batch processing
 // For each window, checks if minimizer is at prefix (pos 0) or suffix (pos w-1)
 // =============================================================================
-void syncmers_simd_fused(
+void syncmers_simd_fused_packed(
     const packed_seq::PackedSeq& seq,
     uint32_t seq_len,
     uint32_t k,      // syncmer k-mer size
@@ -1415,7 +1415,7 @@ extern "C" uint32_t syncmers_to_buffer(
     positions.clear();
     positions.reserve(std::min(out_capacity, seq_len / (k - m + 1)));
 
-    syncmers_simd_fused(seq, seq_len, k, m, positions);
+    syncmers_simd_fused_packed(seq, seq_len, k, m, positions);
 
     uint32_t count = std::min((uint32_t)positions.size(), out_capacity);
     memcpy(out_buf, positions.data(), count * sizeof(uint32_t));
@@ -1675,9 +1675,8 @@ extern "C" uint64_t benchmark_nthash_packed_seq(
     return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
-// Benchmark non-canonical FULL pipeline (for comparison with canonical)
-// Uses NEW fused collection (same as canonical) for fair comparison
-extern "C" uint64_t benchmark_noncanonical_full(
+// Benchmark non-canonical pipeline (pre-packed sequence)
+extern "C" uint64_t benchmark_noncanonical(
     const uint8_t* ascii_seq,
     uint32_t seq_len,
     uint32_t k,
@@ -1699,7 +1698,6 @@ extern "C" uint64_t benchmark_noncanonical_full(
 
     for (uint32_t iter = 0; iter < iterations; iter++) {
         positions.clear();
-        // Use NEW fused collection (same as canonical_minimizers_simd_fused_packed)
         minimizers_simd_fused_packed(seq_packed, seq_len, k, w, positions);
 
         if (!positions.empty()) {
@@ -1711,10 +1709,8 @@ extern "C" uint64_t benchmark_noncanonical_full(
     return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
-// Benchmark canonical FULL pipeline DIRECTLY (no FFI result handling)
-// This times only the core algorithm without malloc/memcpy/free overhead
-// Pre-packs sequence OUTSIDE timing loop for fair comparison with Rust
-extern "C" uint64_t benchmark_canonical_full_direct(
+// Benchmark canonical pipeline (pre-packed sequence)
+extern "C" uint64_t benchmark_canonical(
     const uint8_t* ascii_seq,
     uint32_t seq_len,
     uint32_t k,
@@ -1877,11 +1873,8 @@ extern "C" uint64_t benchmark_dedup_scalar_isolated(uint32_t iterations) {
     return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
-// =============================================================================
-// Benchmark syncmers DIRECTLY (like benchmark_noncanonical_full)
-// Pre-packs sequence OUTSIDE timing loop for fair comparison
-// =============================================================================
-extern "C" uint64_t benchmark_syncmers_direct(
+// Benchmark syncmers pipeline (pre-packed sequence)
+extern "C" uint64_t benchmark_syncmers(
     const uint8_t* ascii_seq,
     uint32_t seq_len,
     uint32_t k,      // syncmer k-mer size
@@ -1904,7 +1897,7 @@ extern "C" uint64_t benchmark_syncmers_direct(
 
     for (uint32_t iter = 0; iter < iterations; iter++) {
         positions.clear();
-        syncmers_simd_fused(seq_packed, seq_len, k, m, positions);
+        syncmers_simd_fused_packed(seq_packed, seq_len, k, m, positions);
 
         if (!positions.empty()) {
             result_sum += positions[0];

@@ -107,8 +107,8 @@ unsafe extern "C" {
         iterations: c_uint,
     ) -> u64;
 
-    /// Benchmark non-canonical full pipeline - returns time in microseconds
-    fn benchmark_noncanonical_full(
+    /// Benchmark non-canonical pipeline - returns time in microseconds
+    fn benchmark_noncanonical(
         ascii_seq: *const c_uchar,
         seq_len: c_uint,
         k: c_uint,
@@ -116,8 +116,8 @@ unsafe extern "C" {
         iterations: c_uint,
     ) -> u64;
 
-    /// Benchmark syncmers (direct, pre-packed sequence) - returns time in microseconds
-    fn benchmark_syncmers_direct(
+    /// Benchmark syncmers (pre-packed sequence) - returns time in microseconds
+    fn benchmark_syncmers(
         ascii_seq: *const c_uchar,
         seq_len: c_uint,
         k: c_uint,
@@ -125,8 +125,8 @@ unsafe extern "C" {
         iterations: c_uint,
     ) -> u64;
 
-    /// Benchmark canonical full pipeline (direct, no FFI overhead) - returns time in microseconds
-    fn benchmark_canonical_full_direct(
+    /// Benchmark canonical pipeline - returns time in microseconds
+    fn benchmark_canonical(
         ascii_seq: *const c_uchar,
         seq_len: c_uint,
         k: c_uint,
@@ -393,9 +393,9 @@ pub fn cpp_benchmark_nthash_packed_seq(ascii_seq: &[u8], k: usize, iterations: u
     }
 }
 
-pub fn cpp_benchmark_noncanonical_full(ascii_seq: &[u8], k: usize, w: usize, iterations: usize) -> u64 {
+pub fn cpp_benchmark_noncanonical(ascii_seq: &[u8], k: usize, w: usize, iterations: usize) -> u64 {
     unsafe {
-        benchmark_noncanonical_full(
+        benchmark_noncanonical(
             ascii_seq.as_ptr(),
             ascii_seq.len() as c_uint,
             k as c_uint,
@@ -405,9 +405,9 @@ pub fn cpp_benchmark_noncanonical_full(ascii_seq: &[u8], k: usize, w: usize, ite
     }
 }
 
-pub fn cpp_benchmark_syncmers_direct(ascii_seq: &[u8], k: usize, m: usize, iterations: usize) -> u64 {
+pub fn cpp_benchmark_syncmers(ascii_seq: &[u8], k: usize, m: usize, iterations: usize) -> u64 {
     unsafe {
-        benchmark_syncmers_direct(
+        benchmark_syncmers(
             ascii_seq.as_ptr(),
             ascii_seq.len() as c_uint,
             k as c_uint,
@@ -417,9 +417,9 @@ pub fn cpp_benchmark_syncmers_direct(ascii_seq: &[u8], k: usize, m: usize, itera
     }
 }
 
-pub fn cpp_benchmark_canonical_full_direct(ascii_seq: &[u8], k: usize, w: usize, iterations: usize) -> u64 {
+pub fn cpp_benchmark_canonical(ascii_seq: &[u8], k: usize, w: usize, iterations: usize) -> u64 {
     unsafe {
-        benchmark_canonical_full_direct(
+        benchmark_canonical(
             ascii_seq.as_ptr(),
             ascii_seq.len() as c_uint,
             k as c_uint,

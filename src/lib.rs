@@ -170,9 +170,9 @@ pub mod cpp {
     pub use crate::cpp_bindings::cpp_syncmers_simd;
     pub use crate::cpp_bindings::CanonicalPhaseTiming;
     pub use crate::cpp_bindings::cpp_benchmark_canonical_phases;
-    pub use crate::cpp_bindings::cpp_benchmark_canonical_full_direct;
-    pub use crate::cpp_bindings::cpp_benchmark_noncanonical_full;
-    pub use crate::cpp_bindings::cpp_benchmark_syncmers_direct;
+    pub use crate::cpp_bindings::cpp_benchmark_canonical;
+    pub use crate::cpp_bindings::cpp_benchmark_noncanonical;
+    pub use crate::cpp_bindings::cpp_benchmark_syncmers;
     pub use crate::cpp_bindings::cpp_benchmark_packed_seq_simd;
     pub use crate::cpp_bindings::cpp_benchmark_nthash_packed_seq;
     pub use crate::cpp_bindings::cpp_get_forward_hashes;
