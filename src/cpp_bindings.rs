@@ -36,13 +36,6 @@ unsafe extern "C" {
         out_capacity: c_uint,
     ) -> c_uint;
 
-    /// Test scalar unrolled ntHash against scalar - returns 1 if match, 0 if mismatch
-    fn test_nthash_scalar_unrolled(
-        seq_data: *const c_uchar,
-        seq_len: c_uint,
-        k: c_uint,
-    ) -> i32;
-
     /// Test scalar sliding window minimum - returns 1 if two-stack matches naive, 0 if mismatch
     fn test_sliding_min_scalar(
         hashes: *const c_uint,
@@ -97,30 +90,6 @@ unsafe extern "C" {
         seq_len: c_uint,
         k: c_uint,
     );
-
-    /// Benchmark scalar unrolled ntHash - returns time in microseconds
-    fn benchmark_nthash_scalar_unrolled(
-        seq_data: *const c_uchar,
-        seq_len: c_uint,
-        k: c_uint,
-        iterations: c_uint,
-    ) -> u64;
-
-    /// Benchmark scalar sliding window minimum - returns time in microseconds
-    fn benchmark_sliding_min_scalar(
-        hashes: *const c_uint,
-        hash_len: c_uint,
-        w: c_uint,
-        iterations: c_uint,
-    ) -> u64;
-
-    /// Benchmark SIMD sliding min - returns time in microseconds
-    fn benchmark_sliding_min_simd(
-        hashes: *const c_uint,
-        hash_len: c_uint,
-        w: c_uint,
-        iterations: c_uint,
-    ) -> u64;
 
     /// Benchmark packed_seq SIMD iteration - returns time in microseconds
     fn benchmark_packed_seq_simd(
@@ -333,10 +302,6 @@ pub fn cpp_syncmers_simd(
 // Test wrappers
 // ============================================================================
 
-pub fn cpp_test_nthash_scalar_unrolled(seq_data: &[u8], k: usize) -> bool {
-    unsafe { test_nthash_scalar_unrolled(seq_data.as_ptr(), seq_data.len() as c_uint, k as c_uint) == 1 }
-}
-
 pub fn cpp_test_sliding_min_scalar(hashes: &[u32], w: usize) -> bool {
     unsafe { test_sliding_min_scalar(hashes.as_ptr(), hashes.len() as c_uint, w as c_uint) == 1 }
 }
@@ -405,39 +370,6 @@ pub fn cpp_get_canonical_hashes_scalar(seq_data: &[u8], k: usize) -> Vec<u32> {
 // ============================================================================
 // Benchmark wrappers
 // ============================================================================
-
-pub fn cpp_benchmark_nthash_simd(seq_data: &[u8], k: usize, iterations: usize) -> u64 {
-    unsafe {
-        benchmark_nthash_scalar_unrolled(
-            seq_data.as_ptr(),
-            seq_data.len() as c_uint,
-            k as c_uint,
-            iterations as c_uint
-        )
-    }
-}
-
-pub fn cpp_benchmark_sliding_min_scalar(hashes: &[u32], w: usize, iterations: usize) -> u64 {
-    unsafe {
-        benchmark_sliding_min_scalar(
-            hashes.as_ptr(),
-            hashes.len() as c_uint,
-            w as c_uint,
-            iterations as c_uint
-        )
-    }
-}
-
-pub fn cpp_benchmark_sliding_min_simd(hashes: &[u32], w: usize, iterations: usize) -> u64 {
-    unsafe {
-        benchmark_sliding_min_simd(
-            hashes.as_ptr(),
-            hashes.len() as c_uint,
-            w as c_uint,
-            iterations as c_uint
-        )
-    }
-}
 
 pub fn cpp_benchmark_packed_seq_simd(ascii_seq: &[u8], k: usize, iterations: usize) -> u64 {
     unsafe {
