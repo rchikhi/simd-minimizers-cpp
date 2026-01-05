@@ -61,20 +61,18 @@ int main() {
     const char* dna = "ACGTGCTCAGAGACTCAGAGGAACGTACGT";
     size_t len = strlen(dna);
 
-    // Pack into 2-bit representation
-    auto seq = packed_seq::PackedSeq::from_ascii(
-        reinterpret_cast<const uint8_t*>(dna), len);
-
     // Parameters
     uint32_t k = 15;  // k-mer size
-    uint32_t w = 10;  // window size
+    uint32_t w = 11;  // window size (k+w-1 must be odd for canonical)
 
-    // Compute canonical minimizers
-    uint32_t* positions;
-    uint32_t num_positions;
-    canonical_minimizers_seq_simd_avx2(
-        seq.data(), seq.len(), k, w,
-        &positions, &num_positions);
+    // Pre-allocate output buffer
+    uint32_t l = k + w - 1;
+    std::vector<uint32_t> positions(len - l + 1);
+
+    // Compute canonical minimizers (zero-copy API)
+    uint32_t num_positions = canonical_minimizers_to_buffer(
+        reinterpret_cast<const uint8_t*>(dna), len, k, w,
+        positions.data(), positions.size());
 
     // Print results
     printf("Found %u minimizers:\n", num_positions);
@@ -82,8 +80,6 @@ int main() {
         printf("  position %u\n", positions[i]);
     }
 
-    // Free allocated memory
-    free_minimizers(positions);
     return 0;
 }
 ```
@@ -110,22 +106,34 @@ g++ -std=c++17 -O3 -mavx2 -march=native \
 
 ## API Reference
 
-### Main Functions
+### Main Functions (Zero-Copy)
 
 ```cpp
 // Compute canonical minimizer positions (SIMD, AVX2)
-// Allocates output array - caller must call free_minimizers()
-void canonical_minimizers_seq_simd_avx2(
-    const uint8_t* seq_data,   // Packed 2-bit sequence data
+// Writes directly to caller-provided buffer, returns count
+// Note: k+w-1 must be odd for canonical minimizers
+uint32_t canonical_minimizers_to_buffer(
+    const uint8_t* seq_data,   // ASCII DNA sequence (ACTG)
     uint32_t seq_len,          // Sequence length in bases
     uint32_t k,                // k-mer size
     uint32_t w,                // Window size
-    uint32_t** out_ptr,        // Output: pointer to positions array
-    uint32_t* out_len          // Output: number of positions
+    uint32_t* out_buf,         // Output buffer for positions
+    uint32_t out_capacity      // Buffer capacity
 );
 
-// Free memory allocated by canonical_minimizers_seq_simd_avx2
-void free_minimizers(uint32_t* ptr);
+// Non-canonical minimizers (faster, strand-dependent)
+uint32_t noncanonical_minimizers_to_buffer(
+    const uint8_t* seq_data, uint32_t seq_len,
+    uint32_t k, uint32_t w,
+    uint32_t* out_buf, uint32_t out_capacity
+);
+
+// Open syncmers (k-mers where minimizer is at prefix or suffix)
+uint32_t syncmers_to_buffer(
+    const uint8_t* seq_data, uint32_t seq_len,
+    uint32_t k, uint32_t m,    // k = syncmer size, m = minimizer size
+    uint32_t* out_buf, uint32_t out_capacity
+);
 ```
 
 ### Packed Sequence Utilities
