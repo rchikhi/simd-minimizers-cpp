@@ -178,10 +178,11 @@ pub mod cpp {
     pub use crate::cpp_bindings::cpp_benchmark_sliding_min_simd;
     pub use crate::cpp_bindings::cpp_benchmark_packed_seq_simd;
     pub use crate::cpp_bindings::cpp_benchmark_nthash_packed_seq;
-    pub use crate::cpp_bindings::cpp_benchmark_hash_slidmin_only;
     pub use crate::cpp_bindings::cpp_get_forward_hashes;
     pub use crate::cpp_bindings::cpp_pack_sequence;
     pub use crate::cpp_bindings::cpp_benchmark_packing;
+    pub use crate::cpp_bindings::cpp_benchmark_dedup_simd;
+    pub use crate::cpp_bindings::cpp_benchmark_dedup_scalar;
 }
 
 /// Re-exported internals. Used for benchmarking, and not part of the semver-compatible stable API.

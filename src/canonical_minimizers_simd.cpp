@@ -435,95 +435,6 @@ static FORCE_INLINE u32x8 simd_blend(i32x8 mask, u32x8 lmin, u32x8 rmin) {
 }
 
 // =============================================================================
-// SIMD Minimizers with packed_seq
-// =============================================================================
-
-void minimizers_simd_packed_seq(
-    const packed_seq::PackedSeq& seq,
-    uint32_t k,
-    uint32_t w,
-    std::vector<u32x8>& out_positions,
-    bool canonical = false
-) {
-    using namespace packed_seq;
-
-    if (seq.len() < k + w - 1) return;
-
-    const uint32_t rot = (k - 1) * ROT;
-    alignas(32) uint32_t f_table[8], c_table[8], f_rot_table[8], c_rot_table[8];
-    for (int i = 0; i < 4; i++) {
-        f_table[i] = f_table[i+4] = HASHES_F[i];
-        c_table[i] = c_table[i+4] = HASHES_F[complement_base(i)];
-        f_rot_table[i] = f_rot_table[i+4] = rotl32(HASHES_F[i], rot);
-        c_rot_table[i] = c_rot_table[i+4] = rotl32(HASHES_F[complement_base(i)], rot);
-    }
-
-    u32x8 simd_f = _mm256_load_si256(reinterpret_cast<const __m256i*>(f_table));
-    u32x8 simd_c = _mm256_load_si256(reinterpret_cast<const __m256i*>(c_table));
-    u32x8 simd_f_rot = _mm256_load_si256(reinterpret_cast<const __m256i*>(f_rot_table));
-    u32x8 simd_c_rot = _mm256_load_si256(reinterpret_cast<const __m256i*>(c_rot_table));
-
-    size_t buf_size = 1;
-    while (buf_size < k) buf_size *= 2;
-    size_t buf_mask = buf_size - 1;
-    alignas(32) u32x8 delay_buf[64];
-    for (size_t i = 0; i < buf_size; i++) {
-        delay_buf[i] = _mm256_setzero_si256();
-    }
-
-    SimdIterState state = simd_iter_init(seq, k + w - 1);
-    size_t chunk_size = state.chunk_size;
-
-    SlidingMinState sliding_min(w, chunk_size, k, 0);
-
-    uint32_t fw_init = 0, rc_init = 0;
-    for (uint32_t i = 0; i < k - 1; i++) {
-        fw_init = rotl32(fw_init, ROT) ^ HASHES_F[0];
-        rc_init = rotr32(rc_init, ROT) ^ c_rot_table[0];
-    }
-    u32x8 h_fw = _mm256_set1_epi32(fw_init);
-    u32x8 h_rc = _mm256_set1_epi32(rc_init);
-
-    size_t write_idx = 0, read_idx = 0;
-    size_t iter_count = 0, output_count = 0;
-
-    while (simd_iter_has_next(state)) {
-        u32x8 add = simd_iter_next(state);
-        u32x8 remove;
-
-        if (iter_count < k - 1) {
-            remove = _mm256_setzero_si256();
-        } else {
-            remove = delay_buf[read_idx];
-            read_idx = (read_idx + 1) & buf_mask;
-        }
-
-        delay_buf[write_idx] = add;
-        write_idx = (write_idx + 1) & buf_mask;
-        iter_count++;
-
-        u32x8 hfw_out = _mm256_xor_si256(simd_rotl(h_fw), table_lookup_avx2(simd_f, add));
-        h_fw = _mm256_xor_si256(hfw_out, table_lookup_avx2(simd_f_rot, remove));
-
-        u32x8 hash;
-        if (canonical) {
-            u32x8 hrc_out = _mm256_xor_si256(simd_rotr(h_rc), table_lookup_avx2(simd_c_rot, add));
-            h_rc = _mm256_xor_si256(hrc_out, table_lookup_avx2(simd_c, remove));
-            hash = _mm256_add_epi32(hfw_out, hrc_out);
-        } else {
-            hash = hfw_out;
-        }
-
-        u32x8 min_pos = sliding_min.process(hash);
-        output_count++;
-
-        if (output_count > (k + w - 2)) {
-            out_positions.push_back(min_pos);
-        }
-    }
-}
-
-// =============================================================================
 // SIMD Transpose (8x8 matrix of u32)
 // Based on: https://stackoverflow.com/questions/25622745/transpose-an-8x8-float-using-avx-avx2
 // =============================================================================
@@ -673,6 +584,29 @@ FORCE_INLINE size_t append_unique_vals_simd(
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + write_idx), packed);
 
     return write_idx + num_unique;
+}
+
+// Scalar dedup - simpler approach that may be faster for sparse output (like Rust)
+// For minimizers with w=11, ~7 of 8 values are duplicates, so scalar branch prediction wins
+FORCE_INLINE size_t append_unique_vals_scalar(
+    u32x8 old_vals,
+    u32x8 new_vals,
+    uint32_t* out,
+    size_t write_idx
+) {
+    alignas(32) uint32_t old_arr[8], new_arr[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(old_arr), old_vals);
+    _mm256_store_si256(reinterpret_cast<__m256i*>(new_arr), new_vals);
+
+    uint32_t prec = old_arr[7];
+    for (int i = 0; i < 8; i++) {
+        uint32_t curr = new_arr[i];
+        if (curr != prec) {
+            out[write_idx++] = curr;
+        }
+        prec = curr;
+    }
+    return write_idx;
 }
 
 void collect_and_dedup_positions(
@@ -835,32 +769,6 @@ void collect_and_dedup_positions(
             out_positions.insert(out_positions.end(), v.begin() + start, v.begin() + end);
         }
     }
-}
-
-void minimizers_simd_packed_seq_collected(
-    const uint8_t* ascii_seq,
-    uint32_t seq_len,
-    uint32_t k,
-    uint32_t w,
-    std::vector<uint32_t>& out_positions,
-    bool canonical = false
-) {
-    using namespace packed_seq;
-
-    uint32_t l = k + w - 1;
-    if (seq_len < l) return;
-
-    PackedSeq seq = PackedSeq::from_ascii(ascii_seq, seq_len);
-    std::vector<u32x8> simd_positions;
-    simd_positions.reserve((seq_len - l + 1) / 8 + 1);
-    minimizers_simd_packed_seq(seq, k, w, simd_positions, canonical);
-
-    SimdIterState state = simd_iter_init(seq, l);
-    size_t chunk_size = state.chunk_size;
-    size_t num_valid_windows = seq_len - l + 1;
-    uint32_t max_position = seq_len - k + 1;
-
-    collect_and_dedup_positions(simd_positions, num_valid_windows, out_positions, max_position);
 }
 
 // =============================================================================
@@ -1875,53 +1783,6 @@ extern "C" void profile_collection_phases(
     *tail_us = total_tail;
 }
 
-// Debug: compare fused vs collected
-extern "C" void debug_compare_fused_vs_collected(
-    const uint8_t* seq_data, uint32_t seq_len, uint32_t k, uint32_t w
-) {
-    size_t l = k + w - 1;
-    size_t num_valid_windows = seq_len - l + 1;
-    size_t num_kmers = num_valid_windows;  // Same thing for minimizers
-    size_t div_ceil_8 = (num_kmers + 7) / 8;
-    size_t chunk_size = ((div_ceil_8 + 3) / 4) * 4;
-    size_t par_len = chunk_size + l - 1;
-
-    std::vector<uint32_t> fused_out, collected_out;
-    canonical_minimizers_simd_fused(seq_data, seq_len, k, w, fused_out);
-    canonical_minimizers_simd_collected(seq_data, seq_len, k, w, collected_out);
-
-    fprintf(stderr, "seq_len=%u, k=%u, w=%u, l=%zu\n", seq_len, k, w, l);
-    fprintf(stderr, "num_valid_windows=%zu, chunk_size=%zu, par_len=%zu\n",
-            num_valid_windows, chunk_size, par_len);
-    fprintf(stderr, "Lane boundaries:\n");
-    for (int j = 0; j < 8; j++) {
-        size_t lane_start = j * chunk_size;
-        size_t lane_end = std::min(lane_start + chunk_size, num_valid_windows);
-        fprintf(stderr, "  Lane %d: [%zu, %zu) (%zu windows)\n",
-                j, lane_start, lane_end, (lane_start < num_valid_windows) ? lane_end - lane_start : 0);
-    }
-    fprintf(stderr, "fused: %zu positions, collected: %zu positions\n",
-            fused_out.size(), collected_out.size());
-
-    // Find first difference
-    size_t max_i = std::max(fused_out.size(), collected_out.size());
-    for (size_t i = 0; i < max_i; i++) {
-        uint32_t f = (i < fused_out.size()) ? fused_out[i] : UINT32_MAX;
-        uint32_t c = (i < collected_out.size()) ? collected_out[i] : UINT32_MAX;
-        if (f != c) {
-            fprintf(stderr, "DIFF at index %zu: fused=%u, collected=%u\n", i, f, c);
-            // Print context
-            for (size_t j = (i > 3 ? i - 3 : 0); j < std::min(i + 5, max_i); j++) {
-                uint32_t fv = (j < fused_out.size()) ? fused_out[j] : UINT32_MAX;
-                uint32_t cv = (j < collected_out.size()) ? collected_out[j] : UINT32_MAX;
-                fprintf(stderr, "  [%zu] fused=%u collected=%u %s\n", j, fv, cv,
-                        (fv != cv) ? "<-- DIFF" : "");
-            }
-            break;
-        }
-    }
-}
-
 // =============================================================================
 // Main Entry Point - Now uses SIMD canonical minimizers
 // =============================================================================
@@ -2000,8 +1861,9 @@ extern "C" void noncanonical_minimizers_simd_avx2(
         std::vector<uint32_t> minimizers;
         minimizers.reserve((seq_len - k + 1) / w);
 
-        // Use the existing collected function (packs internally)
-        minimizers_simd_packed_seq_collected(seq_data, seq_len, k, w, minimizers, false);
+        // Pack ASCII to 2-bit and use fused pipeline
+        auto seq = packed_seq::PackedSeq::from_ascii(seq_data, seq_len);
+        minimizers_simd_fused_packed(seq, seq_len, k, w, minimizers);
 
         *out_len = minimizers.size();
         if (*out_len > 0) {
@@ -2018,6 +1880,90 @@ extern "C" void noncanonical_minimizers_simd_avx2(
         *out_ptr = nullptr;
         *out_len = 0;
     }
+}
+
+// Zero-copy FFI: writes directly to provided buffer (avoids malloc + double copy)
+// Uses thread-local storage to avoid repeated allocation of packed buffer
+// Returns number of positions written, or 0 if buffer too small
+extern "C" uint32_t noncanonical_minimizers_to_buffer(
+    const uint8_t* seq_data,
+    uint32_t seq_len,
+    uint32_t k,
+    uint32_t w,
+    uint32_t* out_buf,
+    uint32_t out_capacity
+) {
+    if (seq_len < k + w - 1) return 0;
+
+    // Thread-local packed buffer - reused across calls to avoid allocation
+    thread_local packed_seq::PackedSeq seq;
+    seq.pack_into(seq_data, seq_len);
+
+    // Thread-local output vector - also reused
+    thread_local std::vector<uint32_t> minimizers;
+    minimizers.clear();
+    minimizers.reserve(std::min(out_capacity, (seq_len - k + 1) / w));
+
+    minimizers_simd_fused_packed(seq, seq_len, k, w, minimizers);
+
+    uint32_t count = std::min((uint32_t)minimizers.size(), out_capacity);
+    memcpy(out_buf, minimizers.data(), count * sizeof(uint32_t));
+    return count;
+}
+
+// Zero-copy FFI for canonical minimizers
+// Uses thread-local storage to avoid repeated allocation
+extern "C" uint32_t canonical_minimizers_to_buffer(
+    const uint8_t* seq_data,
+    uint32_t seq_len,
+    uint32_t k,
+    uint32_t w,
+    uint32_t* out_buf,
+    uint32_t out_capacity
+) {
+    uint32_t l = k + w - 1;
+    if (seq_len < l || l % 2 == 0) return 0;  // Odd window required for canonicality
+
+    thread_local packed_seq::PackedSeq seq;
+    seq.pack_into(seq_data, seq_len);
+
+    thread_local std::vector<uint32_t> minimizers;
+    minimizers.clear();
+    // Reserve for worst case: one position per window
+    uint32_t num_windows = seq_len - l + 1;
+    minimizers.reserve(std::min(out_capacity, num_windows));
+
+    canonical_minimizers_simd_fused_packed(seq, seq_len, k, w, minimizers);
+
+    uint32_t count = std::min((uint32_t)minimizers.size(), out_capacity);
+    memcpy(out_buf, minimizers.data(), count * sizeof(uint32_t));
+    return count;
+}
+
+// Zero-copy FFI for syncmers
+// Uses thread-local storage to avoid repeated allocation
+extern "C" uint32_t syncmers_to_buffer(
+    const uint8_t* seq_data,
+    uint32_t seq_len,
+    uint32_t k,
+    uint32_t m,
+    uint32_t* out_buf,
+    uint32_t out_capacity
+) {
+    if (seq_len < k) return 0;
+
+    thread_local packed_seq::PackedSeq seq;
+    seq.pack_into(seq_data, seq_len);
+
+    thread_local std::vector<uint32_t> positions;
+    positions.clear();
+    positions.reserve(std::min(out_capacity, seq_len / (k - m + 1)));
+
+    syncmers_simd_fused_v2(seq, seq_len, k, m, positions);
+
+    uint32_t count = std::min((uint32_t)positions.size(), out_capacity);
+    memcpy(out_buf, positions.data(), count * sizeof(uint32_t));
+    return count;
 }
 
 // =============================================================================
@@ -2150,7 +2096,8 @@ extern "C" int test_noncanonical_minimizers_simd_vs_rust(
     uint32_t rust_len
 ) {
     std::vector<uint32_t> cpp_positions;
-    minimizers_simd_packed_seq_collected(ascii_seq, seq_len, k, w, cpp_positions, false);
+    auto seq = packed_seq::PackedSeq::from_ascii(ascii_seq, seq_len);
+    minimizers_simd_fused_packed(seq, seq_len, k, w, cpp_positions);
 
     fprintf(stderr, "C++ positions (%zu): ", cpp_positions.size());
     for (size_t i = 0; i < std::min(cpp_positions.size(), (size_t)20); i++) {
@@ -2340,40 +2287,6 @@ extern "C" uint64_t benchmark_nthash_packed_seq(
         alignas(32) uint32_t sums[8];
         _mm256_store_si256(reinterpret_cast<__m256i*>(sums), hash_sum);
         sum += sums[0];
-    }
-
-    auto end = std::chrono::high_resolution_clock::now();
-    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-}
-
-// NOTE: This benchmark only measures hash + sliding min, NO collection!
-// For fair comparison with full pipelines, use benchmark_noncanonical_full instead.
-extern "C" uint64_t benchmark_hash_and_slidmin_only(
-    const uint8_t* ascii_seq,
-    uint32_t seq_len,
-    uint32_t k,
-    uint32_t w,
-    uint32_t iterations
-) {
-    using namespace packed_seq;
-    if (seq_len < k + w - 1) return 0;
-
-    PackedSeq seq = PackedSeq::from_ascii(ascii_seq, seq_len);
-    std::vector<u32x8> positions;
-    positions.reserve((seq_len - k - w + 2) / 8 + 1);
-
-    auto start = std::chrono::high_resolution_clock::now();
-    volatile uint32_t result_sum = 0;
-
-    for (uint32_t iter = 0; iter < iterations; iter++) {
-        positions.clear();
-        minimizers_simd_packed_seq(seq, k, w, positions);
-
-        if (!positions.empty()) {
-            alignas(32) uint32_t vals[8];
-            _mm256_store_si256(reinterpret_cast<__m256i*>(vals), positions[0]);
-            result_sum += vals[0];
-        }
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -2579,6 +2492,30 @@ extern "C" uint64_t benchmark_dedup_isolated(uint32_t iterations) {
         old_vals = new_vals;
 
         // Reset write_idx periodically to avoid running out of buffer
+        if (write_idx > iterations * 4) write_idx = 0;
+    }
+
+    auto end = Clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
+// Benchmark SCALAR dedup in isolation (for comparison with SIMD Lemire)
+extern "C" uint64_t benchmark_dedup_scalar_isolated(uint32_t iterations) {
+    using Clock = std::chrono::high_resolution_clock;
+
+    std::vector<uint32_t> output(iterations * 8 + 64);
+
+    alignas(32) u32x8 old_vals = _mm256_set_epi32(100, 101, 102, 103, 104, 105, 106, 107);
+    alignas(32) u32x8 new_vals_base = _mm256_set_epi32(108, 108, 109, 109, 110, 110, 111, 111);
+
+    auto start = Clock::now();
+
+    size_t write_idx = 0;
+    for (uint32_t iter = 0; iter < iterations; iter++) {
+        u32x8 new_vals = _mm256_add_epi32(new_vals_base, _mm256_set1_epi32(iter & 7));
+        write_idx = append_unique_vals_scalar(old_vals, new_vals, output.data(), write_idx);
+        old_vals = new_vals;
+
         if (write_idx > iterations * 4) write_idx = 0;
     }
 
@@ -2798,10 +2735,10 @@ extern "C" uint32_t pack_sequence_cpp(
         return 0;
     }
 
-    // Zero-init required for |= operations in pack_ascii_direct
+    // Zero-init required for |= operations in pack_ascii_to_buffer
     memset(out_packed, 0, packed_len);
     // Pack directly to output buffer - no intermediate allocation
-    packed_seq::pack_ascii_direct(ascii_seq, seq_len, out_packed);
+    packed_seq::pack_ascii_to_buffer(ascii_seq, seq_len, out_packed);
 
     return packed_len;
 }

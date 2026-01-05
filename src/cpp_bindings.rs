@@ -4,8 +4,6 @@
 #![allow(dead_code)]
 
 use std::os::raw::{c_uchar, c_uint};
-use std::slice;
-use std::ptr;
 
 unsafe extern "C" {
     /// C++ function to compute canonical minimizers
@@ -27,6 +25,36 @@ unsafe extern "C" {
         out_ptr: *mut *mut c_uint,
         out_len: *mut c_uint,
     );
+
+    /// Zero-copy: writes directly to provided buffer (avoids malloc + double copy)
+    fn noncanonical_minimizers_to_buffer(
+        seq_data: *const c_uchar,
+        seq_len: c_uint,
+        k: c_uint,
+        w: c_uint,
+        out_buf: *mut c_uint,
+        out_capacity: c_uint,
+    ) -> c_uint;
+
+    /// Zero-copy canonical minimizers: writes directly to provided buffer
+    fn canonical_minimizers_to_buffer(
+        seq_data: *const c_uchar,
+        seq_len: c_uint,
+        k: c_uint,
+        w: c_uint,
+        out_buf: *mut c_uint,
+        out_capacity: c_uint,
+    ) -> c_uint;
+
+    /// Zero-copy syncmers: writes directly to provided buffer
+    fn syncmers_to_buffer(
+        seq_data: *const c_uchar,
+        seq_len: c_uint,
+        k: c_uint,
+        m: c_uint,
+        out_buf: *mut c_uint,
+        out_capacity: c_uint,
+    ) -> c_uint;
 
     /// Test scalar unrolled ntHash against scalar - returns 1 if match, 0 if mismatch
     fn test_nthash_scalar_unrolled(
@@ -130,15 +158,6 @@ unsafe extern "C" {
         iterations: c_uint,
     ) -> u64;
 
-    /// Benchmark fused hash + sliding min (no collection) - returns time in microseconds
-    fn benchmark_hash_and_slidmin_only(
-        ascii_seq: *const c_uchar,
-        seq_len: c_uint,
-        k: c_uint,
-        w: c_uint,
-        iterations: c_uint,
-    ) -> u64;
-
     /// Benchmark non-canonical full pipeline - returns time in microseconds
     fn benchmark_noncanonical_full(
         ascii_seq: *const c_uchar,
@@ -206,6 +225,12 @@ unsafe extern "C" {
         seq_len: c_uint,
         iterations: c_uint,
     ) -> u64;
+
+    /// Benchmark SIMD Lemire dedup in isolation - returns time in microseconds
+    fn benchmark_dedup_isolated(iterations: c_uint) -> u64;
+
+    /// Benchmark scalar dedup in isolation - returns time in microseconds
+    fn benchmark_dedup_scalar_isolated(iterations: c_uint) -> u64;
 }
 
 // ============================================================================
@@ -217,7 +242,7 @@ unsafe extern "C" {
 /// This function computes the canonical minimizers of a sequence using
 /// AVX2 SIMD instructions.
 ///
-/// The function handles the FFI details and memory management, providing a safe interface.
+/// Uses zero-copy FFI: writes directly to pre-allocated buffer, avoiding malloc+copy overhead.
 pub fn cpp_canonical_minimizer_positions(
     seq_data: &[u8],
     k: usize,
@@ -236,78 +261,64 @@ pub fn cpp_canonical_minimizer_positions(
         return;
     }
 
-    // Prepare output parameters
-    let mut out_ptr: *mut c_uint = ptr::null_mut();
-    let mut out_len: c_uint = 0;
+    // Pre-allocate buffer: worst case is one position per window
+    let num_windows = seq_data.len() - l + 1;
+    out_minimizers.reserve(num_windows);
 
+    // Use zerocopy: write directly to Vec's spare capacity
+    let old_len = out_minimizers.len();
     unsafe {
-        // Call the C++ implementation
-        canonical_minimizers_seq_simd_avx2(
+        let spare = out_minimizers.spare_capacity_mut();
+        let buf = std::slice::from_raw_parts_mut(
+            spare.as_mut_ptr() as *mut u32,
+            spare.len()
+        );
+        let count = canonical_minimizers_to_buffer(
             seq_data.as_ptr(),
             seq_data.len() as c_uint,
             k as c_uint,
             w as c_uint,
-            &mut out_ptr,
-            &mut out_len,
-        );
-
-        // If we got results, copy them to the Rust vector
-        if !out_ptr.is_null() && out_len > 0 {
-            // Create a slice from the returned buffer
-            let result_slice = slice::from_raw_parts(out_ptr, out_len as usize);
-
-            // Extend the output vector with the results
-            out_minimizers.extend_from_slice(result_slice);
-
-            // Free the memory allocated by C++
-            libc::free(out_ptr as *mut libc::c_void);
-        }
+            buf.as_mut_ptr(),
+            buf.len() as c_uint,
+        ) as usize;
+        out_minimizers.set_len(old_len + count);
     }
 }
 
 /// Compute non-canonical minimizer positions using C++ AVX2 SIMD implementation.
 ///
-/// This function computes the non-canonical (forward-only) minimizers of a sequence
-/// using AVX2 SIMD instructions. Packs the sequence per call (true e2e measurement).
+/// Uses zero-copy FFI: writes directly to pre-allocated buffer, avoiding malloc+copy overhead.
 pub fn cpp_noncanonical_minimizer_positions(
     seq_data: &[u8],
     k: usize,
     w: usize,
     out_minimizers: &mut Vec<u32>
 ) {
-    let l = k + w - 1;
-
-    // Check if there's enough sequence data
-    if seq_data.len() < l {
+    if seq_data.len() < k + w - 1 {
         return;
     }
 
-    // Prepare output parameters
-    let mut out_ptr: *mut c_uint = ptr::null_mut();
-    let mut out_len: c_uint = 0;
+    // Pre-allocate buffer (worst case: one minimizer per window)
+    let max_positions = (seq_data.len() - k + 1) / w + 8;
+    out_minimizers.reserve(max_positions);
 
+    // Use zerocopy: extend vec's capacity and write directly
+    let old_len = out_minimizers.len();
     unsafe {
-        // Call the C++ implementation
-        noncanonical_minimizers_simd_avx2(
+        let spare = out_minimizers.spare_capacity_mut();
+        let buf = std::slice::from_raw_parts_mut(
+            spare.as_mut_ptr() as *mut u32,
+            spare.len()
+        );
+        let count = noncanonical_minimizers_to_buffer(
             seq_data.as_ptr(),
             seq_data.len() as c_uint,
             k as c_uint,
             w as c_uint,
-            &mut out_ptr,
-            &mut out_len,
-        );
-
-        // If we got results, copy them to the Rust vector
-        if !out_ptr.is_null() && out_len > 0 {
-            // Create a slice from the returned buffer
-            let result_slice = slice::from_raw_parts(out_ptr, out_len as usize);
-
-            // Extend the output vector with the results
-            out_minimizers.extend_from_slice(result_slice);
-
-            // Free the memory allocated by C++
-            libc::free(out_ptr as *mut libc::c_void);
-        }
+            buf.as_mut_ptr(),
+            buf.len() as c_uint,
+        ) as usize;
+        out_minimizers.set_len(old_len + count);
     }
 }
 
@@ -315,37 +326,39 @@ pub fn cpp_noncanonical_minimizer_positions(
 ///
 /// Syncmers are k-mers where the minimizer (of size m) appears at the
 /// prefix (position 0) or suffix (position k-m) of the k-mer.
+/// Uses zero-copy FFI: writes directly to pre-allocated buffer, avoiding malloc+copy overhead.
 pub fn cpp_syncmers_simd(
     seq_data: &[u8],
     k: u32,
     m: u32,
     out_syncmers: &mut Vec<u32>
 ) {
-    let w = k - m + 1;
-    let l = m + w - 1; // = k
-
-    if seq_data.len() < l as usize {
+    if seq_data.len() < k as usize {
         return;
     }
 
-    let mut out_ptr: *mut c_uint = ptr::null_mut();
-    let mut out_len: c_uint = 0;
+    // Pre-allocate buffer
+    let w = k - m + 1;
+    let max_positions = seq_data.len() / w as usize + 8;
+    out_syncmers.reserve(max_positions);
 
+    // Use zerocopy: write directly to Vec's spare capacity
+    let old_len = out_syncmers.len();
     unsafe {
-        syncmers_simd_avx2(
+        let spare = out_syncmers.spare_capacity_mut();
+        let buf = std::slice::from_raw_parts_mut(
+            spare.as_mut_ptr() as *mut u32,
+            spare.len()
+        );
+        let count = syncmers_to_buffer(
             seq_data.as_ptr(),
             seq_data.len() as c_uint,
             k,
             m,
-            &mut out_ptr,
-            &mut out_len,
-        );
-
-        if !out_ptr.is_null() && out_len > 0 {
-            let results = slice::from_raw_parts(out_ptr, out_len as usize);
-            out_syncmers.extend_from_slice(results);
-            free_minimizers(out_ptr);
-        }
+            buf.as_mut_ptr(),
+            buf.len() as c_uint,
+        ) as usize;
+        out_syncmers.set_len(old_len + count);
     }
 }
 
@@ -481,18 +494,6 @@ pub fn cpp_benchmark_nthash_packed_seq(ascii_seq: &[u8], k: usize, iterations: u
     }
 }
 
-pub fn cpp_benchmark_hash_slidmin_only(ascii_seq: &[u8], k: usize, w: usize, iterations: usize) -> u64 {
-    unsafe {
-        benchmark_hash_and_slidmin_only(
-            ascii_seq.as_ptr(),
-            ascii_seq.len() as c_uint,
-            k as c_uint,
-            w as c_uint,
-            iterations as c_uint
-        )
-    }
-}
-
 pub fn cpp_benchmark_noncanonical_full(ascii_seq: &[u8], k: usize, w: usize, iterations: usize) -> u64 {
     unsafe {
         benchmark_noncanonical_full(
@@ -585,6 +586,18 @@ pub fn cpp_benchmark_packing(ascii_seq: &[u8], iterations: usize) -> u64 {
             iterations as c_uint,
         )
     }
+}
+
+/// Benchmark C++ SIMD Lemire dedup in isolation
+/// Returns time in microseconds for all iterations
+pub fn cpp_benchmark_dedup_simd(iterations: usize) -> u64 {
+    unsafe { benchmark_dedup_isolated(iterations as c_uint) }
+}
+
+/// Benchmark C++ scalar dedup in isolation
+/// Returns time in microseconds for all iterations
+pub fn cpp_benchmark_dedup_scalar(iterations: usize) -> u64 {
+    unsafe { benchmark_dedup_scalar_isolated(iterations as c_uint) }
 }
 
 // ============================================================================

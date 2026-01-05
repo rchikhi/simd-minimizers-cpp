@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 use packed_seq::{PackedSeqVec, SeqVec};
 use simd_minimizers::cpp::{
     cpp_benchmark_packed_seq_simd, cpp_benchmark_nthash_packed_seq,
-    cpp_benchmark_hash_slidmin_only, cpp_benchmark_noncanonical_full,
+    cpp_benchmark_noncanonical_full,
     cpp_benchmark_canonical_full_direct, cpp_benchmark_canonical_phases,
     cpp_canonical_minimizer_positions, cpp_noncanonical_minimizer_positions,
     cpp_benchmark_syncmers_direct,
+    cpp_benchmark_dedup_simd, cpp_benchmark_dedup_scalar,
 };
 
 fn generate_random_dna(len: usize) -> Vec<u8> {
@@ -35,7 +36,7 @@ fn main() {
     let seq_len = 1_000_000;
     let k = 21;
     let w = 11;
-    let iterations = 10;
+    let iterations = 20;
 
     println!("Benchmark: seq_len={}, k={}, w={}", seq_len, k, w);
 
@@ -49,8 +50,8 @@ fn main() {
         simd_minimizers::canonical_minimizers(k, w).run(packed_seq.as_slice(), &mut out);
     }, iterations);
 
-    // Full Rust SIMD pipeline (non-canonical)
-    let rust_noncanonical_full_time = measure_time(|| {
+    // Rust SIMD pipeline (non-canonical, packing excluded)
+    let rust_noncanonical_prepacked_time = measure_time(|| {
         let mut out = Vec::new();
         simd_minimizers::minimizers(k, w).run(packed_seq.as_slice(), &mut out);
     }, iterations);
@@ -75,13 +76,9 @@ fn main() {
     let cpp_nthash_packed_us = cpp_benchmark_nthash_packed_seq(&seq_data, k, iterations);
     let cpp_nthash_packed_time = Duration::from_micros(cpp_nthash_packed_us / iterations as u64);
 
-    // C++ hash + sliding min only (NO collection/dedup - not comparable to FULL)
-    let cpp_hash_slidmin_us = cpp_benchmark_hash_slidmin_only(&seq_data, k, w, iterations);
-    let cpp_hash_slidmin_time = Duration::from_micros(cpp_hash_slidmin_us / iterations as u64);
-
-    // C++ non-canonical FULL pipeline (for comparison with canonical)
-    let cpp_noncanonical_full_us = cpp_benchmark_noncanonical_full(&seq_data, k, w, iterations);
-    let cpp_noncanonical_full_time = Duration::from_micros(cpp_noncanonical_full_us / iterations as u64);
+    // C++ non-canonical pipeline (packing excluded from timing)
+    let cpp_noncanonical_prepacked_us = cpp_benchmark_noncanonical_full(&seq_data, k, w, iterations);
+    let cpp_noncanonical_prepacked_time = Duration::from_micros(cpp_noncanonical_prepacked_us / iterations as u64);
 
     // C++ canonical FULL pipeline DIRECT (no FFI result handling - just timing the core algorithm)
     let cpp_canonical_direct_us = cpp_benchmark_canonical_full_direct(&seq_data, k, w, iterations);
@@ -102,9 +99,6 @@ fn main() {
     println!("C++ ntHash (packed_seq)   | {:9.2} | {:7.1}",
         cpp_nthash_packed_time.as_secs_f64() * 1000.0,
         mb / cpp_nthash_packed_time.as_secs_f64());
-    println!("C++ hash+min (no collect) | {:9.2} | {:7.1}",
-        cpp_hash_slidmin_time.as_secs_f64() * 1000.0,
-        mb / cpp_hash_slidmin_time.as_secs_f64());
     println!("Rust scalar baseline      | {:9.2} | {:7.1}",
         rust_full_scalar_time.as_secs_f64() * 1000.0,
         mb / rust_full_scalar_time.as_secs_f64());
@@ -131,7 +125,7 @@ fn main() {
         simd_minimizers::canonical_minimizers(k, w).run(packed.as_slice(), &mut out);
     }, iterations);
 
-    // C++ e2e: non-canonical (packs per call via FFI wrapper)
+    // C++ e2e: non-canonical (uses zero-copy FFI internally)
     let cpp_e2e_noncanonical = measure_time(|| {
         let mut out = Vec::new();
         cpp_noncanonical_minimizer_positions(&seq_data, k, w, &mut out);
@@ -180,13 +174,13 @@ fn main() {
     println!("                          | Time (ms) | MB/s   | ns/nt");
     println!("--------------------------|-----------|--------|------");
     println!("Rust non-canonical        | {:9.2} | {:6.1} | {:5.2}",
-        rust_noncanonical_full_time.as_secs_f64() * 1000.0,
-        mb / rust_noncanonical_full_time.as_secs_f64(),
-        rust_noncanonical_full_time.as_secs_f64() * 1e9 / seq_len as f64);
+        rust_noncanonical_prepacked_time.as_secs_f64() * 1000.0,
+        mb / rust_noncanonical_prepacked_time.as_secs_f64(),
+        rust_noncanonical_prepacked_time.as_secs_f64() * 1e9 / seq_len as f64);
     println!("C++  non-canonical        | {:9.2} | {:6.1} | {:5.2}",
-        cpp_noncanonical_full_time.as_secs_f64() * 1000.0,
-        mb / cpp_noncanonical_full_time.as_secs_f64(),
-        cpp_noncanonical_full_time.as_secs_f64() * 1e9 / seq_len as f64);
+        cpp_noncanonical_prepacked_time.as_secs_f64() * 1000.0,
+        mb / cpp_noncanonical_prepacked_time.as_secs_f64(),
+        cpp_noncanonical_prepacked_time.as_secs_f64() * 1e9 / seq_len as f64);
     println!("Rust canonical            | {:9.2} | {:6.1} | {:5.2}",
         rust_full_simd_time.as_secs_f64() * 1000.0,
         mb / rust_full_simd_time.as_secs_f64(),
@@ -209,4 +203,21 @@ fn main() {
     println!("  Init:       {:5} us ({:4.1}%)", phases.init_us / iterations as u64, pct(phases.init_us));
     println!("  Main loop:  {:5} us ({:4.1}%)", phases.main_loop_us / iterations as u64, pct(phases.main_loop_us));
     println!("  Collect:    {:5} us ({:4.1}%)", phases.final_flatten_us / iterations as u64, pct(phases.final_flatten_us));
+
+    // Dedup comparison (SIMD Lemire vs scalar)
+    println!();
+    println!("Dedup Strategy Comparison (C++):");
+    let dedup_iterations = 1000;
+    let dedup_simd_us = cpp_benchmark_dedup_simd(dedup_iterations);
+    let dedup_scalar_us = cpp_benchmark_dedup_scalar(dedup_iterations);
+    println!("  SIMD Lemire: {:6} us / {} iters = {:5.2} us/iter",
+        dedup_simd_us, dedup_iterations, dedup_simd_us as f64 / dedup_iterations as f64);
+    println!("  Scalar:      {:6} us / {} iters = {:5.2} us/iter",
+        dedup_scalar_us, dedup_iterations, dedup_scalar_us as f64 / dedup_iterations as f64);
+    let speedup = dedup_simd_us as f64 / dedup_scalar_us as f64;
+    if speedup > 1.0 {
+        println!("  => Scalar is {:.1}x faster", speedup);
+    } else {
+        println!("  => SIMD is {:.1}x faster", 1.0 / speedup);
+    }
 }

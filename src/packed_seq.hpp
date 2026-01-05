@@ -50,8 +50,8 @@ inline uint16_t pack_8_chars_pext(const uint8_t* ascii) {
 #endif
 
 // Pack ASCII sequence directly into a pre-zeroed output buffer
-// This is the core packing function - all other packing methods should use this
-inline void pack_ascii_direct(const uint8_t* ascii, size_t len, uint8_t* out) {
+// Core packing function - all PackedSeq methods use this internally
+inline void pack_ascii_to_buffer(const uint8_t* ascii, size_t len, uint8_t* out) {
 #ifdef __BMI2__
     // Fast path: use PEXT to pack 8 chars at a time into 2 bytes
     size_t i = 0;
@@ -116,8 +116,8 @@ public:
         size_t data_size = (len + 3) / 4 + 32;
         seq.data_.resize(data_size, 0);
 
-        // Use the standalone pack_ascii_direct function
-        pack_ascii_direct(ascii, len, seq.data_.data());
+        // Use the standalone packing function
+        pack_ascii_to_buffer(ascii, len, seq.data_.data());
 
         return seq;
     }
@@ -140,6 +140,21 @@ public:
 
     size_t len() const { return len_; }
     const uint8_t* data() const { return data_.data(); }
+
+    // Allow access to internal vector for reuse
+    std::vector<uint8_t>& data_vec() { return data_; }
+
+    // Reuse existing buffer for new ASCII sequence (avoids allocation if buffer is large enough)
+    void pack_into(const uint8_t* ascii, size_t len) {
+        len_ = len;
+        offset_ = 0;
+        size_t data_size = (len + 3) / 4 + 32;
+        if (data_.size() < data_size) {
+            data_.resize(data_size);
+        }
+        memset(data_.data(), 0, data_size);
+        pack_ascii_to_buffer(ascii, len, data_.data());
+    }
 
     // Get base at position i
     uint8_t get(size_t i) const {
