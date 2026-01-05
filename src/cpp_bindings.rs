@@ -18,6 +18,16 @@ unsafe extern "C" {
         out_len: *mut c_uint,
     );
 
+    /// C++ function to compute non-canonical minimizers (packs per call = true e2e)
+    fn noncanonical_minimizers_simd_avx2(
+        seq_data: *const c_uchar,
+        seq_len: c_uint,
+        k: c_uint,
+        w: c_uint,
+        out_ptr: *mut *mut c_uint,
+        out_len: *mut c_uint,
+    );
+
     /// Test scalar unrolled ntHash against scalar - returns 1 if match, 0 if mismatch
     fn test_nthash_scalar_unrolled(
         seq_data: *const c_uchar,
@@ -138,6 +148,15 @@ unsafe extern "C" {
         iterations: c_uint,
     ) -> u64;
 
+    /// Benchmark syncmers (direct, pre-packed sequence) - returns time in microseconds
+    fn benchmark_syncmers_direct(
+        ascii_seq: *const c_uchar,
+        seq_len: c_uint,
+        k: c_uint,
+        m: c_uint,
+        iterations: c_uint,
+    ) -> u64;
+
     /// Benchmark canonical full pipeline (direct, no FFI overhead) - returns time in microseconds
     fn benchmark_canonical_full_direct(
         ascii_seq: *const c_uchar,
@@ -161,6 +180,32 @@ unsafe extern "C" {
 
     /// Free minimizers buffer allocated by C++
     fn free_minimizers(ptr: *mut c_uint);
+
+    /// Compute syncmers using C++ SIMD
+    fn syncmers_simd_avx2(
+        ascii_seq: *const c_uchar,
+        seq_len: c_uint,
+        k: c_uint,
+        m: c_uint,
+        out_ptr: *mut *mut c_uint,
+        out_len: *mut c_uint,
+    );
+
+    /// Pack ASCII sequence to 2-bit format and return packed bytes
+    /// Returns number of packed bytes written
+    fn pack_sequence_cpp(
+        ascii_seq: *const c_uchar,
+        seq_len: c_uint,
+        out_packed: *mut c_uchar,
+        out_capacity: c_uint,
+    ) -> c_uint;
+
+    /// Benchmark packing only - returns time in microseconds
+    fn benchmark_packing(
+        ascii_seq: *const c_uchar,
+        seq_len: c_uint,
+        iterations: c_uint,
+    ) -> u64;
 }
 
 // ============================================================================
@@ -216,6 +261,90 @@ pub fn cpp_canonical_minimizer_positions(
 
             // Free the memory allocated by C++
             libc::free(out_ptr as *mut libc::c_void);
+        }
+    }
+}
+
+/// Compute non-canonical minimizer positions using C++ AVX2 SIMD implementation.
+///
+/// This function computes the non-canonical (forward-only) minimizers of a sequence
+/// using AVX2 SIMD instructions. Packs the sequence per call (true e2e measurement).
+pub fn cpp_noncanonical_minimizer_positions(
+    seq_data: &[u8],
+    k: usize,
+    w: usize,
+    out_minimizers: &mut Vec<u32>
+) {
+    let l = k + w - 1;
+
+    // Check if there's enough sequence data
+    if seq_data.len() < l {
+        return;
+    }
+
+    // Prepare output parameters
+    let mut out_ptr: *mut c_uint = ptr::null_mut();
+    let mut out_len: c_uint = 0;
+
+    unsafe {
+        // Call the C++ implementation
+        noncanonical_minimizers_simd_avx2(
+            seq_data.as_ptr(),
+            seq_data.len() as c_uint,
+            k as c_uint,
+            w as c_uint,
+            &mut out_ptr,
+            &mut out_len,
+        );
+
+        // If we got results, copy them to the Rust vector
+        if !out_ptr.is_null() && out_len > 0 {
+            // Create a slice from the returned buffer
+            let result_slice = slice::from_raw_parts(out_ptr, out_len as usize);
+
+            // Extend the output vector with the results
+            out_minimizers.extend_from_slice(result_slice);
+
+            // Free the memory allocated by C++
+            libc::free(out_ptr as *mut libc::c_void);
+        }
+    }
+}
+
+/// Compute syncmers using C++ AVX2 SIMD implementation.
+///
+/// Syncmers are k-mers where the minimizer (of size m) appears at the
+/// prefix (position 0) or suffix (position k-m) of the k-mer.
+pub fn cpp_syncmers_simd(
+    seq_data: &[u8],
+    k: u32,
+    m: u32,
+    out_syncmers: &mut Vec<u32>
+) {
+    let w = k - m + 1;
+    let l = m + w - 1; // = k
+
+    if seq_data.len() < l as usize {
+        return;
+    }
+
+    let mut out_ptr: *mut c_uint = ptr::null_mut();
+    let mut out_len: c_uint = 0;
+
+    unsafe {
+        syncmers_simd_avx2(
+            seq_data.as_ptr(),
+            seq_data.len() as c_uint,
+            k,
+            m,
+            &mut out_ptr,
+            &mut out_len,
+        );
+
+        if !out_ptr.is_null() && out_len > 0 {
+            let results = slice::from_raw_parts(out_ptr, out_len as usize);
+            out_syncmers.extend_from_slice(results);
+            free_minimizers(out_ptr);
         }
     }
 }
@@ -376,6 +505,18 @@ pub fn cpp_benchmark_noncanonical_full(ascii_seq: &[u8], k: usize, w: usize, ite
     }
 }
 
+pub fn cpp_benchmark_syncmers_direct(ascii_seq: &[u8], k: usize, m: usize, iterations: usize) -> u64 {
+    unsafe {
+        benchmark_syncmers_direct(
+            ascii_seq.as_ptr(),
+            ascii_seq.len() as c_uint,
+            k as c_uint,
+            m as c_uint,
+            iterations as c_uint
+        )
+    }
+}
+
 pub fn cpp_benchmark_canonical_full_direct(ascii_seq: &[u8], k: usize, w: usize, iterations: usize) -> u64 {
     unsafe {
         benchmark_canonical_full_direct(
@@ -415,6 +556,34 @@ pub fn cpp_benchmark_canonical_phases(ascii_seq: &[u8], k: usize, w: usize, iter
         init_us,
         main_loop_us,
         final_flatten_us,
+    }
+}
+
+/// Pack an ASCII sequence using C++ implementation
+/// Returns the packed bytes (4 bases per byte)
+pub fn cpp_pack_sequence(ascii_seq: &[u8]) -> Vec<u8> {
+    let packed_len = (ascii_seq.len() + 3) / 4;
+    let mut out = vec![0u8; packed_len];
+    unsafe {
+        pack_sequence_cpp(
+            ascii_seq.as_ptr(),
+            ascii_seq.len() as c_uint,
+            out.as_mut_ptr(),
+            packed_len as c_uint,
+        );
+    }
+    out
+}
+
+/// Benchmark C++ packing performance
+/// Returns time in microseconds for all iterations
+pub fn cpp_benchmark_packing(ascii_seq: &[u8], iterations: usize) -> u64 {
+    unsafe {
+        benchmark_packing(
+            ascii_seq.as_ptr(),
+            ascii_seq.len() as c_uint,
+            iterations as c_uint,
+        )
     }
 }
 

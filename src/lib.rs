@@ -166,16 +166,22 @@ mod cpp_bindings;
 /// C++ implementation bindings for comparison/benchmarking.
 pub mod cpp {
     pub use crate::cpp_bindings::cpp_canonical_minimizer_positions;
+    pub use crate::cpp_bindings::cpp_noncanonical_minimizer_positions;
+    pub use crate::cpp_bindings::cpp_syncmers_simd;
     pub use crate::cpp_bindings::CanonicalPhaseTiming;
     pub use crate::cpp_bindings::cpp_benchmark_canonical_phases;
     pub use crate::cpp_bindings::cpp_benchmark_canonical_full_direct;
     pub use crate::cpp_bindings::cpp_benchmark_noncanonical_full;
+    pub use crate::cpp_bindings::cpp_benchmark_syncmers_direct;
     pub use crate::cpp_bindings::cpp_benchmark_nthash_simd;
     pub use crate::cpp_bindings::cpp_benchmark_sliding_min_scalar;
     pub use crate::cpp_bindings::cpp_benchmark_sliding_min_simd;
     pub use crate::cpp_bindings::cpp_benchmark_packed_seq_simd;
     pub use crate::cpp_bindings::cpp_benchmark_nthash_packed_seq;
     pub use crate::cpp_bindings::cpp_benchmark_hash_slidmin_only;
+    pub use crate::cpp_bindings::cpp_get_forward_hashes;
+    pub use crate::cpp_bindings::cpp_pack_sequence;
+    pub use crate::cpp_bindings::cpp_benchmark_packing;
 }
 
 /// Re-exported internals. Used for benchmarking, and not part of the semver-compatible stable API.
@@ -306,6 +312,32 @@ impl<'h, const CANONICAL: bool, H: KmerHasher> Builder<'h, CANONICAL, H, ()> {
         min_pos: &'o mut Vec<u32>,
     ) -> Output<'o, CANONICAL, SEQ> {
         self.run_impl::<true, _>(seq, min_pos)
+    }
+
+    /// Collect all positions without deduplication.
+    /// Returns one position per window in sequence order.
+    /// This is useful for computing syncmers which need to check each window's minimizer position.
+    pub fn run_all_once<'s, SEQ: Seq<'s>>(&self, seq: SEQ) -> Vec<u32> {
+        let mut min_pos = vec![];
+        self.run_all(seq, &mut min_pos);
+        min_pos
+    }
+
+    /// Collect all positions without deduplication into a provided vector.
+    /// Returns one position per window in sequence order.
+    /// This is useful for computing syncmers which need to check each window's minimizer position.
+    pub fn run_all<'s, SEQ: Seq<'s>>(&self, seq: SEQ, min_pos: &mut Vec<u32>) {
+        let default_hasher = self.hasher.is_none().then(|| H::new(self.k));
+        let hasher = self
+            .hasher
+            .unwrap_or_else(|| default_hasher.as_ref().unwrap());
+
+        CACHE.with_borrow_mut(|cache| match CANONICAL {
+            false => minimizers_seq_simd(seq, hasher, self.w, &mut cache.0)
+                .collect_all_into(min_pos),
+            true => canonical_minimizers_seq_simd(seq, hasher, self.w, &mut cache.0)
+                .collect_all_into(min_pos),
+        });
     }
 
     fn run_impl<'s, 'o, const SIMD: bool, SEQ: Seq<'s>>(

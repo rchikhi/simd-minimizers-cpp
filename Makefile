@@ -12,9 +12,12 @@ CXXFLAGS = -std=c++17 -O3 -mavx2 -Wall -Wno-array-bounds -Wno-unused-variable -W
 SRCS = src/canonical_minimizers_simd.cpp src/canonical_minimizers_scalar.cpp
 HDRS = src/canonical_minimizers.hpp src/packed_seq.hpp
 
-.PHONY: all clean test
+.PHONY: all clean test syncmer_benchmark
 
 all: test_cpp
+
+syncmer_benchmark: src/syncmer_benchmark.cpp $(SRCS) $(HDRS)
+	$(CXX) $(CXXFLAGS) -o $@ src/syncmer_benchmark.cpp $(SRCS)
 
 # Build test executable (requires adding a main() to one of the cpp files or creating test_main.cpp)
 test_cpp: $(SRCS) $(HDRS)
@@ -28,4 +31,4 @@ check: $(SRCS) $(HDRS)
 	@rm -f /tmp/simd.o /tmp/scalar.o
 
 clean:
-	rm -f test_cpp /tmp/simd.o /tmp/scalar.o
+	rm -f test_cpp syncmer_benchmark /tmp/simd.o /tmp/scalar.o

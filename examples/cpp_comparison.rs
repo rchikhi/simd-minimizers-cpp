@@ -12,6 +12,7 @@ use simd_minimizers::cpp::{
     cpp_benchmark_nthash_packed_seq, cpp_benchmark_hash_slidmin_only,
     cpp_benchmark_noncanonical_full, cpp_benchmark_canonical_full_direct,
     cpp_benchmark_canonical_phases, cpp_canonical_minimizer_positions,
+    cpp_noncanonical_minimizer_positions, cpp_benchmark_syncmers_direct,
 };
 
 fn generate_random_dna(len: usize) -> Vec<u8> {
@@ -195,4 +196,110 @@ fn main() {
     println!("  Final flatten (copy lanes to output):       {:>6} us ({:.1}%)",
              phases.final_flatten_us / iterations as u64,
              100.0 * phases.final_flatten_us as f64 / total_phase_us as f64);
+
+    // =========================================================================
+    // End-to-End Performance (ASCII → Minimizers)
+    // =========================================================================
+    // This section measures REAL-WORLD performance starting from ASCII input.
+    // Both Rust and C++ include packing time for fair comparison.
+
+    println!();
+    println!("============================================================");
+    println!("End-to-End Performance (ASCII → Minimizers)");
+    println!("============================================================");
+    println!("NOTE: Both Rust and C++ times INCLUDE sequence packing.");
+    println!();
+
+    // Rust end-to-end: non-canonical (pack + algorithm)
+    let rust_e2e_noncanonical = measure_time(|| {
+        let packed = PackedSeqVec::from_ascii(&seq_data);
+        let mut out = Vec::new();
+        simd_minimizers::minimizers(k, w).run(packed.as_slice(), &mut out);
+    }, iterations);
+
+    // Rust end-to-end: canonical (pack + algorithm)
+    let rust_e2e_canonical = measure_time(|| {
+        let packed = PackedSeqVec::from_ascii(&seq_data);
+        let mut out = Vec::new();
+        simd_minimizers::canonical_minimizers(k, w).run(packed.as_slice(), &mut out);
+    }, iterations);
+
+    // C++ e2e: non-canonical (packs per call via FFI wrapper)
+    let cpp_e2e_noncanonical = measure_time(|| {
+        let mut out = Vec::new();
+        cpp_noncanonical_minimizer_positions(&seq_data, k, w, &mut out);
+    }, iterations);
+
+    // C++ e2e: canonical already measured above as cpp_full_simd_time
+
+    // C++ e2e: syncmers (packs per call via FFI wrapper)
+    let syncmer_k = 21;
+    let syncmer_m = 11;
+    let cpp_e2e_syncmers = measure_time(|| {
+        let mut out = Vec::new();
+        simd_minimizers::cpp::cpp_syncmers_simd(&seq_data, syncmer_k as u32, syncmer_m as u32, &mut out);
+    }, iterations);
+
+    // C++ pre-packed: syncmers (for completeness)
+    let cpp_syncmers_prepacked_us = cpp_benchmark_syncmers_direct(&seq_data, syncmer_k, syncmer_m, iterations);
+    let cpp_syncmers_prepacked_time = Duration::from_micros(cpp_syncmers_prepacked_us / iterations as u64);
+
+    println!("End-to-End (ASCII → minimizers, packing INCLUDED):");
+    println!("                          | Time (ms) | MB/s   | ns/nt");
+    println!("--------------------------|-----------|--------|------");
+    println!("Rust non-canonical        | {:9.2} | {:6.1} | {:5.2}",
+        rust_e2e_noncanonical.as_secs_f64() * 1000.0,
+        mb / rust_e2e_noncanonical.as_secs_f64(),
+        rust_e2e_noncanonical.as_secs_f64() * 1e9 / seq_len as f64);
+    println!("C++  non-canonical        | {:9.2} | {:6.1} | {:5.2}",
+        cpp_e2e_noncanonical.as_secs_f64() * 1000.0,
+        mb / cpp_e2e_noncanonical.as_secs_f64(),
+        cpp_e2e_noncanonical.as_secs_f64() * 1e9 / seq_len as f64);
+    println!("Rust canonical            | {:9.2} | {:6.1} | {:5.2}",
+        rust_e2e_canonical.as_secs_f64() * 1000.0,
+        mb / rust_e2e_canonical.as_secs_f64(),
+        rust_e2e_canonical.as_secs_f64() * 1e9 / seq_len as f64);
+    println!("C++  canonical            | {:9.2} | {:6.1} | {:5.2}",
+        cpp_full_simd_time.as_secs_f64() * 1000.0,
+        mb / cpp_full_simd_time.as_secs_f64(),
+        cpp_full_simd_time.as_secs_f64() * 1e9 / seq_len as f64);
+    println!("C++  syncmers             | {:9.2} | {:6.1} | {:5.2}",
+        cpp_e2e_syncmers.as_secs_f64() * 1000.0,
+        mb / cpp_e2e_syncmers.as_secs_f64(),
+        cpp_e2e_syncmers.as_secs_f64() * 1e9 / seq_len as f64);
+
+    println!();
+    println!("Pre-packed (algorithm only, packing EXCLUDED):");
+    println!("                          | Time (ms) | MB/s   | ns/nt");
+    println!("--------------------------|-----------|--------|------");
+    println!("Rust non-canonical        | {:9.2} | {:6.1} | {:5.2}",
+        rust_noncanonical_full_time.as_secs_f64() * 1000.0,
+        mb / rust_noncanonical_full_time.as_secs_f64(),
+        rust_noncanonical_full_time.as_secs_f64() * 1e9 / seq_len as f64);
+    println!("C++  non-canonical        | {:9.2} | {:6.1} | {:5.2}",
+        cpp_noncanonical_full_time.as_secs_f64() * 1000.0,
+        mb / cpp_noncanonical_full_time.as_secs_f64(),
+        cpp_noncanonical_full_time.as_secs_f64() * 1e9 / seq_len as f64);
+    println!("Rust canonical            | {:9.2} | {:6.1} | {:5.2}",
+        rust_full_simd_time.as_secs_f64() * 1000.0,
+        mb / rust_full_simd_time.as_secs_f64(),
+        rust_full_simd_time.as_secs_f64() * 1e9 / seq_len as f64);
+    println!("C++  canonical            | {:9.2} | {:6.1} | {:5.2}",
+        cpp_canonical_direct_time.as_secs_f64() * 1000.0,
+        mb / cpp_canonical_direct_time.as_secs_f64(),
+        cpp_canonical_direct_time.as_secs_f64() * 1e9 / seq_len as f64);
+    println!("C++  syncmers             | {:9.2} | {:6.1} | {:5.2}",
+        cpp_syncmers_prepacked_time.as_secs_f64() * 1000.0,
+        mb / cpp_syncmers_prepacked_time.as_secs_f64(),
+        cpp_syncmers_prepacked_time.as_secs_f64() * 1e9 / seq_len as f64);
+
+    // 3-phase breakdown (for non-regression: main loop should dominate)
+    println!();
+    println!("Phase Breakdown (C++ canonical):");
+    let phases = cpp_benchmark_canonical_phases(&seq_data, k, w, iterations);
+    let total_us = phases.init_us + phases.main_loop_us + phases.final_flatten_us;
+    let pct = |x: u64| 100.0 * x as f64 / total_us as f64;
+    println!("  Init:       {:5} us ({:4.1}%)", phases.init_us / iterations as u64, pct(phases.init_us));
+    println!("  Main loop:  {:5} us ({:4.1}%)", phases.main_loop_us / iterations as u64, pct(phases.main_loop_us));
+    println!("  Collect:    {:5} us ({:4.1}%)", phases.final_flatten_us / iterations as u64, pct(phases.final_flatten_us));
 }

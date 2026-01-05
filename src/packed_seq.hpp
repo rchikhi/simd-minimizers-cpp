@@ -31,16 +31,23 @@ using u64x4 = __m256i;
 // Storage: 4 bases per byte, LSB = first base (little-endian)
 // =============================================================================
 
-// Pack an ASCII character to 2-bit representation
+// Pack an ASCII character to 2-bit representation (branchless version)
+// A/a=0x41/0x61, C/c=0x43/0x63, G/g=0x47/0x67, T/t=0x54/0x74
+// (c >> 1) & 3 gives: A=0, C=1, G=3, T=2 which matches our encoding
 inline uint8_t pack_char(uint8_t c) {
-    switch (c) {
-        case 'A': case 'a': return 0;
-        case 'C': case 'c': return 1;
-        case 'T': case 't': return 2;
-        case 'G': case 'g': return 3;
-        default: return 0;  // Treat unknown as A
-    }
+    return (c >> 1) & 3;
 }
+
+// PEXT-based packing: pack 8 ASCII chars into 2 bytes using BMI2
+// Extracts bits 1-2 from each byte which encode A=0, C=1, T=2, G=3
+#ifdef __BMI2__
+inline uint16_t pack_8_chars_pext(const uint8_t* ascii) {
+    uint64_t chars;
+    memcpy(&chars, ascii, 8);
+    // Mask 0x0606... selects bits 1-2 from each byte
+    return static_cast<uint16_t>(_pext_u64(chars, 0x0606060606060606ULL));
+}
+#endif
 
 // Unpack 2-bit representation to ASCII
 inline char unpack_char(uint8_t b) {
@@ -79,12 +86,33 @@ public:
         size_t data_size = (len + 3) / 4 + 32;
         seq.data_.resize(data_size, 0);
 
+#ifdef __BMI2__
+        // Fast path: use PEXT to pack 8 chars at a time into 2 bytes
+        size_t i = 0;
+        size_t byte_idx = 0;
+
+        // Process 8 chars (2 output bytes) at a time
+        for (; i + 8 <= len; i += 8, byte_idx += 2) {
+            uint16_t packed = pack_8_chars_pext(ascii + i);
+            memcpy(&seq.data_[byte_idx], &packed, 2);
+        }
+
+        // Handle remaining chars (0-7)
+        for (; i < len; i++) {
+            size_t bidx = i / 4;
+            size_t bit_offset = (i % 4) * 2;
+            uint8_t base = pack_char(ascii[i]);
+            seq.data_[bidx] |= (base << bit_offset);
+        }
+#else
+        // Scalar fallback (branchless)
         for (size_t i = 0; i < len; i++) {
             size_t byte_idx = i / 4;
             size_t bit_offset = (i % 4) * 2;
             uint8_t base = pack_char(ascii[i]);
             seq.data_[byte_idx] |= (base << bit_offset);
         }
+#endif
         return seq;
     }
 
@@ -178,6 +206,7 @@ struct SimdIterState {
     size_t pos;               // Current position within chunks
     u32x8 cur;                // Current buffered data (8 lanes)
     size_t buf_pos;           // Position within buffered data (0-15)
+    __m256i base_indices;     // Precomputed: [0, bpc, 2*bpc, ..., 7*bpc]
 };
 
 // Initialize SIMD iterator state
@@ -202,6 +231,14 @@ inline SimdIterState simd_iter_init(const PackedSeq& seq, size_t context) {
     state.pos = 0;
     state.cur = _mm256_setzero_si256();
     state.buf_pos = 16;  // Force initial load
+
+    // Precompute base indices: [0, bpc, 2*bpc, ..., 7*bpc]
+    size_t bpc = state.bytes_per_chunk;
+    alignas(32) int32_t base_idx[8] = {
+        0, (int32_t)bpc, (int32_t)(2*bpc), (int32_t)(3*bpc),
+        (int32_t)(4*bpc), (int32_t)(5*bpc), (int32_t)(6*bpc), (int32_t)(7*bpc)
+    };
+    state.base_indices = _mm256_load_si256(reinterpret_cast<const __m256i*>(base_idx));
 
     return state;
 }
@@ -237,13 +274,9 @@ inline void simd_iter_load(SimdIterState& state) {
     // Calculate byte offset within each chunk
     size_t byte_offset = state.pos / 4;
 
-    // Build gather indices for all 8 lanes
-    // Each lane reads from: lane * bytes_per_chunk + byte_offset
-    alignas(32) int32_t indices[8];
-    for (int i = 0; i < 8; i++) {
-        indices[i] = (int32_t)(i * state.bytes_per_chunk + byte_offset);
-    }
-    __m256i idx = _mm256_load_si256(reinterpret_cast<const __m256i*>(indices));
+    // Add byte_offset to precomputed base indices
+    __m256i offset = _mm256_set1_epi32((int32_t)byte_offset);
+    __m256i idx = _mm256_add_epi32(state.base_indices, offset);
 
     // Gather 4 bytes (16 bases) for each of 8 lanes
     state.cur = _mm256_i32gather_epi32(

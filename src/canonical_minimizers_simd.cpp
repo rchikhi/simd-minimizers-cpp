@@ -1259,6 +1259,221 @@ void minimizers_simd_fused_packed(
 }
 
 // =============================================================================
+// Helper: Append filtered values using SIMD compaction
+// Appends values from `vals` where corresponding `mask` bit is 0 (not filtered out)
+// =============================================================================
+FORCE_INLINE size_t append_filtered_vals_simd(
+    u32x8 vals,
+    int mask,  // 8-bit mask: 1 = skip, 0 = keep
+    uint32_t* out,
+    size_t write_idx
+) {
+    int num_to_write = 8 - __builtin_popcount(mask);
+    if (num_to_write == 0) return write_idx;
+
+    u32x8 shuffle_idx = _mm256_load_si256(reinterpret_cast<const __m256i*>(UNIQSHUF[mask]));
+    u32x8 packed = _mm256_permutevar8x32_epi32(vals, shuffle_idx);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + write_idx), packed);
+
+    return write_idx + num_to_write;
+}
+
+// =============================================================================
+// Syncmer computation - inline check during batch processing
+// For each window, checks if minimizer is at prefix (pos 0) or suffix (pos w-1)
+// =============================================================================
+void syncmers_simd_fused_v2(
+    const packed_seq::PackedSeq& seq,
+    uint32_t seq_len,
+    uint32_t k,      // syncmer k-mer size
+    uint32_t m,      // minimizer size (s-mer)
+    std::vector<uint32_t>& out_positions
+) {
+    using namespace packed_seq;
+
+    const uint32_t w = k - m + 1;
+    const uint32_t l = m + w - 1;  // = k
+    if (seq_len < l) return;
+
+    // Hash constants
+    const uint32_t rot = (m - 1) * ROT;
+    alignas(32) uint32_t f_table[8], f_rot_table[8];
+    for (int i = 0; i < 4; i++) {
+        f_table[i] = f_table[i+4] = HASHES_F[i];
+        f_rot_table[i] = f_rot_table[i+4] = rotl32(HASHES_F[i], rot);
+    }
+    u32x8 simd_f = _mm256_load_si256(reinterpret_cast<const __m256i*>(f_table));
+    u32x8 simd_f_rot = _mm256_load_si256(reinterpret_cast<const __m256i*>(f_rot_table));
+
+    // Delay buffer
+    size_t buf_size = 1;
+    while (buf_size < m) buf_size *= 2;
+    size_t buf_mask = buf_size - 1;
+    alignas(32) u32x8 delay_buf[64];
+    for (size_t i = 0; i < buf_size; i++) delay_buf[i] = _mm256_setzero_si256();
+
+    SimdIterState state = simd_iter_init(seq, l);
+    size_t chunk_size = state.chunk_size;
+    SlidingMinState sliding_min(w, chunk_size, m, 0);
+
+    uint32_t fw_init = 0;
+    for (uint32_t i = 0; i < m - 1; i++) {
+        fw_init = rotl32(fw_init, ROT) ^ HASHES_F[0];
+    }
+    u32x8 h_fw = _mm256_set1_epi32(fw_init);
+
+    size_t buf_write_idx = 0, buf_read_idx = 0;
+    size_t iter_count = 0;
+    size_t output_count = 0;
+
+    size_t num_valid_windows = seq_len - l + 1;
+
+    // Lane cache for collecting results
+    size_t max_per_lane = chunk_size + 64;
+    if (!lane_cache_initialized) {
+        for (int i = 0; i < 8; i++) lane_cache[i].reserve(max_per_lane);
+        lane_cache_initialized = true;
+    }
+    // Like minimizers: just check capacity, use lane_write_idx to track positions
+    for (int i = 0; i < 8; i++) {
+        if (lane_cache[i].capacity() < max_per_lane) lane_cache[i].reserve(max_per_lane);
+    }
+    size_t lane_write_idx[8] = {0};
+
+    // Batch buffer
+    u32x8 batch[8];
+    size_t batch_count = 0;
+
+    // Constants for syncmer check
+    const u32x8 SIMD_MAX = _mm256_set1_epi32(UINT32_MAX);
+    const u32x8 idx_offsets = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+    const u32x8 w_minus_1 = _mm256_set1_epi32(w - 1);
+
+    // Pre-compute lane bases: lane_base[j] = j * chunk_size
+    u32x8 lane_base[8];
+    for (int j = 0; j < 8; j++) {
+        lane_base[j] = _mm256_set1_epi32((uint32_t)(j * chunk_size));
+    }
+
+    size_t fast_path_limit = (num_valid_windows > 7 * chunk_size + 7) ? num_valid_windows - 7 * chunk_size - 7 : 0;
+    const u32x8 valid_limit = _mm256_set1_epi32((uint32_t)num_valid_windows);
+
+    // Main loop - same as minimizers
+    while (simd_iter_has_next(state)) {
+        u32x8 add = simd_iter_next(state);
+        u32x8 remove;
+
+        if (__builtin_expect(iter_count < m - 1, 0)) {
+            remove = _mm256_setzero_si256();
+        } else {
+            remove = delay_buf[buf_read_idx];
+            buf_read_idx = (buf_read_idx + 1) & buf_mask;
+        }
+        delay_buf[buf_write_idx] = add;
+        buf_write_idx = (buf_write_idx + 1) & buf_mask;
+        iter_count++;
+
+        // Hash
+        u32x8 hfw_out = _mm256_xor_si256(simd_rotl(h_fw), table_lookup_avx2(simd_f, add));
+        h_fw = _mm256_xor_si256(hfw_out, table_lookup_avx2(simd_f_rot, remove));
+
+        // Sliding min
+        u32x8 min_pos = sliding_min.process(hfw_out);
+        output_count++;
+
+        if (__builtin_expect(output_count > l - 1, 1)) {
+            batch[batch_count % 8] = min_pos;
+            batch_count++;
+
+            if (batch_count % 8 == 0) {
+                // Transpose and apply syncmer filter
+                u32x8 t[8];
+                transpose_8x8(batch, t);
+                size_t batch_start = batch_count - 8;
+
+                // SAME STRUCTURE AS MINIMIZERS (for testing)
+                for (int j = 0; j < 8; j++) {
+                    // Compute lane_offsets for this lane
+                    u32x8 lane_offsets = _mm256_add_epi32(
+                        lane_base[j],
+                        _mm256_add_epi32(_mm256_set1_epi32((uint32_t)batch_start), idx_offsets)
+                    );
+                    u32x8 suffix_offsets = _mm256_add_epi32(lane_offsets, w_minus_1);
+
+                    // Syncmer check: min_pos at prefix or suffix
+                    u32x8 is_prefix = _mm256_cmpeq_epi32(t[j], lane_offsets);
+                    u32x8 is_suffix = _mm256_cmpeq_epi32(t[j], suffix_offsets);
+                    u32x8 is_syncmer = _mm256_or_si256(is_prefix, is_suffix);
+
+                    // Output lane_offsets if syncmer, else MAX
+                    u32x8 result = _mm256_blendv_epi8(SIMD_MAX, lane_offsets, is_syncmer);
+
+                    // Filter and collect
+                    if (lane_write_idx[j] + 8 > lane_cache[j].size()) {
+                        lane_cache[j].resize(lane_cache[j].size() + 1024);
+                    }
+                    u32x8 cmp_max = _mm256_cmpeq_epi32(result, SIMD_MAX);
+                    int skip_mask = _mm256_movemask_ps(_mm256_castsi256_ps(cmp_max));
+                    lane_write_idx[j] = append_filtered_vals_simd(
+                        result, skip_mask, lane_cache[j].data(), lane_write_idx[j]
+                    );
+                }
+            }
+        }
+    }
+
+    // Handle partial last batch
+    size_t partial = batch_count % 8;
+    if (partial > 0) {
+        for (size_t i = partial; i < 8; i++) batch[i] = SIMD_MAX;
+        u32x8 t[8];
+        transpose_8x8(batch, t);
+        size_t batch_start = (batch_count / 8) * 8;
+        u32x8 batch_start_plus_idx = _mm256_add_epi32(
+            _mm256_set1_epi32((uint32_t)batch_start), idx_offsets
+        );
+
+        for (int j = 0; j < 8; j++) {
+            // After transpose: t[j][i] is from lane j, iteration (batch_start + i)
+            // Window position for element i = j * chunk_size + batch_start + i
+            u32x8 lane_offsets = _mm256_add_epi32(lane_base[j], batch_start_plus_idx);
+            u32x8 suffix_offsets = _mm256_add_epi32(lane_offsets, w_minus_1);
+
+            u32x8 is_prefix = _mm256_cmpeq_epi32(t[j], lane_offsets);
+            u32x8 is_suffix = _mm256_cmpeq_epi32(t[j], suffix_offsets);
+            u32x8 is_syncmer = _mm256_or_si256(is_prefix, is_suffix);
+
+            // Output window position (lane_offsets) if syncmer, else MAX
+            u32x8 result = _mm256_blendv_epi8(SIMD_MAX, lane_offsets, is_syncmer);
+
+            // Always check validity for partial batch
+            u32x8 valid_mask = _mm256_cmpgt_epi32(valid_limit, lane_offsets);
+            result = _mm256_blendv_epi8(SIMD_MAX, result, valid_mask);
+
+            if (lane_write_idx[j] + 8 > lane_cache[j].size()) {
+                lane_cache[j].resize(lane_cache[j].size() + 1024);
+            }
+            u32x8 cmp_max = _mm256_cmpeq_epi32(result, SIMD_MAX);
+            int skip_mask = _mm256_movemask_ps(_mm256_castsi256_ps(cmp_max));
+            lane_write_idx[j] = append_filtered_vals_simd(
+                result, skip_mask, lane_cache[j].data(), lane_write_idx[j]
+            );
+        }
+    }
+
+    // Just concatenate lanes (no sort/dedup for now - testing raw performance)
+    size_t total = 0;
+    for (int i = 0; i < 8; i++) total += lane_write_idx[i];
+    out_positions.reserve(total);
+
+    for (int i = 0; i < 8; i++) {
+        out_positions.insert(out_positions.end(),
+                            lane_cache[i].data(),
+                            lane_cache[i].data() + lane_write_idx[i]);
+    }
+}
+
+// =============================================================================
 // Timing struct for profiling (used by profile_collection_phases and benchmark_canonical_phases)
 // =============================================================================
 struct FusedPhaseTiming {
@@ -1764,6 +1979,45 @@ extern "C" void canonical_minimizers_seq_simd_avx2(
 
 extern "C" void free_minimizers(uint32_t* ptr) {
     if (ptr) free(ptr);
+}
+
+// FFI wrapper for non-canonical minimizers (packs per call = true e2e)
+extern "C" void noncanonical_minimizers_simd_avx2(
+    const uint8_t* seq_data,
+    uint32_t seq_len,
+    uint32_t k,
+    uint32_t w,
+    uint32_t** out_ptr,
+    uint32_t* out_len
+) {
+    try {
+        if (seq_len == 0) {
+            *out_ptr = nullptr;
+            *out_len = 0;
+            return;
+        }
+
+        std::vector<uint32_t> minimizers;
+        minimizers.reserve((seq_len - k + 1) / w);
+
+        // Use the existing collected function (packs internally)
+        minimizers_simd_packed_seq_collected(seq_data, seq_len, k, w, minimizers, false);
+
+        *out_len = minimizers.size();
+        if (*out_len > 0) {
+            *out_ptr = (uint32_t*)malloc(*out_len * sizeof(uint32_t));
+            if (*out_ptr == nullptr) {
+                *out_len = 0;
+                return;
+            }
+            memcpy(*out_ptr, minimizers.data(), *out_len * sizeof(uint32_t));
+        } else {
+            *out_ptr = nullptr;
+        }
+    } catch (...) {
+        *out_ptr = nullptr;
+        *out_len = 0;
+    }
 }
 
 // =============================================================================
@@ -2455,5 +2709,116 @@ extern "C" uint64_t benchmark_collection_batch_isolated(uint32_t iterations) {
     }
 
     auto end = Clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
+// =============================================================================
+// Benchmark syncmers DIRECTLY (like benchmark_noncanonical_full)
+// Pre-packs sequence OUTSIDE timing loop for fair comparison
+// =============================================================================
+extern "C" uint64_t benchmark_syncmers_direct(
+    const uint8_t* ascii_seq,
+    uint32_t seq_len,
+    uint32_t k,      // syncmer k-mer size
+    uint32_t m,      // minimizer size (s-mer)
+    uint32_t iterations
+) {
+    using namespace packed_seq;
+
+    uint32_t w = k - m + 1;
+    if (seq_len < k) return 0;
+
+    // Pre-pack sequence OUTSIDE timing loop (same as minimizer benchmark)
+    PackedSeq seq_packed = PackedSeq::from_ascii(ascii_seq, seq_len);
+
+    std::vector<uint32_t> positions;
+    positions.reserve(seq_len / w);
+
+    auto start = std::chrono::high_resolution_clock::now();
+    volatile uint32_t result_sum = 0;
+
+    for (uint32_t iter = 0; iter < iterations; iter++) {
+        positions.clear();
+        syncmers_simd_fused_v2(seq_packed, seq_len, k, m, positions);
+
+        if (!positions.empty()) {
+            result_sum += positions[0];
+        }
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
+// =============================================================================
+// FFI wrapper for syncmers
+// =============================================================================
+
+extern "C" void syncmers_simd_avx2(
+    const uint8_t* ascii_seq,
+    uint32_t seq_len,
+    uint32_t k,      // syncmer k-mer size
+    uint32_t m,      // minimizer size (s-mer)
+    uint32_t** out_ptr,
+    uint32_t* out_len
+) {
+    // Pack the ASCII sequence
+    auto packed = packed_seq::PackedSeq::from_ascii(ascii_seq, seq_len);
+
+    // Compute syncmers using optimized fused SIMD implementation
+    std::vector<uint32_t> result;
+    result.reserve(seq_len / (k - m + 1));
+    syncmers_simd_fused_v2(packed, seq_len, k, m, result);
+
+    // Allocate output and copy
+    *out_len = static_cast<uint32_t>(result.size());
+    if (result.empty()) {
+        *out_ptr = nullptr;
+        return;
+    }
+
+    *out_ptr = static_cast<uint32_t*>(malloc(result.size() * sizeof(uint32_t)));
+    memcpy(*out_ptr, result.data(), result.size() * sizeof(uint32_t));
+}
+
+// =============================================================================
+// Packing benchmark functions
+// =============================================================================
+
+// Pack ASCII sequence to 2-bit format (uses PEXT when available)
+extern "C" uint32_t pack_sequence_cpp(
+    const uint8_t* ascii_seq,
+    uint32_t seq_len,
+    uint8_t* out_packed,
+    uint32_t out_capacity
+) {
+    uint32_t packed_len = (seq_len + 3) / 4;
+    if (packed_len > out_capacity) {
+        return 0;
+    }
+
+    // Use the optimized from_ascii which uses PEXT on BMI2 systems
+    auto packed = packed_seq::PackedSeq::from_ascii(ascii_seq, seq_len);
+    memcpy(out_packed, packed.data(), packed_len);
+
+    return packed_len;
+}
+
+// Benchmark packing performance
+extern "C" uint64_t benchmark_packing(
+    const uint8_t* ascii_seq,
+    uint32_t seq_len,
+    uint32_t iterations
+) {
+    auto start = std::chrono::high_resolution_clock::now();
+    volatile uint32_t result_sum = 0;
+
+    for (uint32_t iter = 0; iter < iterations; iter++) {
+        auto packed = packed_seq::PackedSeq::from_ascii(ascii_seq, seq_len);
+        // Prevent optimization
+        result_sum += packed.data()[0];
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
     return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }

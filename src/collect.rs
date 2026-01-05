@@ -89,6 +89,18 @@ pub trait CollectAndDedup: Sized {
         (v, v2)
     }
 
+    /// Collect all positions without deduplication.
+    /// Returns one position per window in sequence order.
+    fn collect_all(self) -> Vec<u32> {
+        let mut v = vec![];
+        self.collect_all_into(&mut v);
+        v
+    }
+
+    /// Collect all positions without deduplication into a vector.
+    /// Returns one position per window in sequence order.
+    fn collect_all_into(self, out_vec: &mut Vec<u32>);
+
     /// Collect a SIMD-iterator into a single vector, and duplicate adjacent equal elements.
     /// Works by taking 8 elements from each stream, and then transposing the SIMD-matrix before writing out the results.
     ///
@@ -124,6 +136,66 @@ thread_local! {
 }
 
 impl<I: ChunkIt<u32x8>> CollectAndDedup for PaddedIt<I> {
+    /// Collect all positions without deduplication into a vector.
+    /// Returns one position per window in sequence order.
+    ///
+    /// The SIMD iterator processes the sequence in 8 parallel consecutive chunks (lanes).
+    /// Lane 0 processes the first ~n/8 windows, lane 1 the next ~n/8 windows, etc.
+    /// This function concatenates results from all lanes in order.
+    #[inline(always)]
+    fn collect_all_into(self, out_vec: &mut Vec<u32>) {
+        let Self { it, padding } = self;
+
+        let len = it.len();
+        // Total number of windows across all 8 lanes
+        let total_windows = 8 * len - padding;
+
+        // Collect positions per lane first
+        let mut lane_bufs: [Vec<u32>; 8] = from_fn(|_| Vec::with_capacity(len));
+
+        let mut mask = u32x8::ZERO;
+        let mut padding_i = 0;
+        let mut padding_idx = 0;
+        assert!(padding <= L * len, "padding {padding} <= L {L} * len {len}");
+        let mut remaining_padding = padding;
+        for i in (0..8).rev() {
+            if remaining_padding >= len {
+                mask.as_array_mut()[i] = u32::MAX;
+                remaining_padding -= len;
+                continue;
+            }
+            padding_i = len - remaining_padding;
+            padding_idx = i;
+            break;
+        }
+
+        let mut i = 0;
+        it.for_each(
+            #[inline(always)]
+            |x| {
+                if i == padding_i {
+                    mask.as_array_mut()[padding_idx] = u32::MAX;
+                }
+                let x = x | mask;
+                // Store position from each lane into its respective buffer
+                let arr = x.as_array_ref();
+                for (lane_idx, &val) in arr.iter().enumerate() {
+                    if val != u32::MAX {
+                        lane_bufs[lane_idx].push(val);
+                    }
+                }
+                i += 1;
+            },
+        );
+
+        // Concatenate lane buffers in order (lanes process consecutive chunks)
+        out_vec.clear();
+        out_vec.reserve(total_windows);
+        for lane in lane_bufs.iter() {
+            out_vec.extend_from_slice(lane);
+        }
+    }
+
     #[inline(always)]
     fn collect_and_dedup_into_impl<const SUPER: bool, const SKIP_MAX: bool>(
         self,
