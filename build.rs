@@ -28,7 +28,8 @@ fn main() {
     cc.cpp(true)
         .file("src/canonical_minimizers_simd.cpp")
         .file("src/canonical_minimizers_scalar.cpp")
-        .flag_if_supported("-march=native")  // CPU-specific optimizations (like Rust's target-cpu=native)
+        .flag("-march=native")  // CPU-specific optimizations (like Rust's target-cpu=native)
+        .flag_if_supported("-mbmi2")  // Ensure PEXT is enabled for fast packing
         .flag_if_supported("-O3")
         .flag_if_supported("-std=c++17")  // For structured bindings
         .flag_if_supported("-Wno-array-bounds")  // Suppress array bounds warnings

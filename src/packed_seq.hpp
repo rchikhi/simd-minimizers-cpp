@@ -49,6 +49,36 @@ inline uint16_t pack_8_chars_pext(const uint8_t* ascii) {
 }
 #endif
 
+// Pack ASCII sequence directly into a pre-zeroed output buffer
+// This is the core packing function - all other packing methods should use this
+inline void pack_ascii_direct(const uint8_t* ascii, size_t len, uint8_t* out) {
+#ifdef __BMI2__
+    // Fast path: use PEXT to pack 8 chars at a time into 2 bytes
+    size_t i = 0;
+    size_t byte_idx = 0;
+
+    // Process 8 chars (2 output bytes) at a time
+    for (; i + 8 <= len; i += 8, byte_idx += 2) {
+        uint16_t packed = pack_8_chars_pext(ascii + i);
+        memcpy(&out[byte_idx], &packed, 2);
+    }
+
+    // Handle remaining chars (0-7)
+    for (; i < len; i++) {
+        size_t bidx = i / 4;
+        size_t bit_offset = (i % 4) * 2;
+        out[bidx] |= (pack_char(ascii[i]) << bit_offset);
+    }
+#else
+    // Scalar fallback (branchless)
+    for (size_t i = 0; i < len; i++) {
+        size_t byte_idx = i / 4;
+        size_t bit_offset = (i % 4) * 2;
+        out[byte_idx] |= (pack_char(ascii[i]) << bit_offset);
+    }
+#endif
+}
+
 // Unpack 2-bit representation to ASCII
 inline char unpack_char(uint8_t b) {
     static const char bases[4] = {'A', 'C', 'T', 'G'};
@@ -86,33 +116,9 @@ public:
         size_t data_size = (len + 3) / 4 + 32;
         seq.data_.resize(data_size, 0);
 
-#ifdef __BMI2__
-        // Fast path: use PEXT to pack 8 chars at a time into 2 bytes
-        size_t i = 0;
-        size_t byte_idx = 0;
+        // Use the standalone pack_ascii_direct function
+        pack_ascii_direct(ascii, len, seq.data_.data());
 
-        // Process 8 chars (2 output bytes) at a time
-        for (; i + 8 <= len; i += 8, byte_idx += 2) {
-            uint16_t packed = pack_8_chars_pext(ascii + i);
-            memcpy(&seq.data_[byte_idx], &packed, 2);
-        }
-
-        // Handle remaining chars (0-7)
-        for (; i < len; i++) {
-            size_t bidx = i / 4;
-            size_t bit_offset = (i % 4) * 2;
-            uint8_t base = pack_char(ascii[i]);
-            seq.data_[bidx] |= (base << bit_offset);
-        }
-#else
-        // Scalar fallback (branchless)
-        for (size_t i = 0; i < len; i++) {
-            size_t byte_idx = i / 4;
-            size_t bit_offset = (i % 4) * 2;
-            uint8_t base = pack_char(ascii[i]);
-            seq.data_[byte_idx] |= (base << bit_offset);
-        }
-#endif
         return seq;
     }
 

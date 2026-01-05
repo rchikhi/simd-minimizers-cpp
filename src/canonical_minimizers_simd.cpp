@@ -2786,6 +2786,7 @@ extern "C" void syncmers_simd_avx2(
 // =============================================================================
 
 // Pack ASCII sequence to 2-bit format (uses PEXT when available)
+// Writes directly to output buffer - no intermediate allocation or copy
 extern "C" uint32_t pack_sequence_cpp(
     const uint8_t* ascii_seq,
     uint32_t seq_len,
@@ -2797,9 +2798,10 @@ extern "C" uint32_t pack_sequence_cpp(
         return 0;
     }
 
-    // Use the optimized from_ascii which uses PEXT on BMI2 systems
-    auto packed = packed_seq::PackedSeq::from_ascii(ascii_seq, seq_len);
-    memcpy(out_packed, packed.data(), packed_len);
+    // Zero-init required for |= operations in pack_ascii_direct
+    memset(out_packed, 0, packed_len);
+    // Pack directly to output buffer - no intermediate allocation
+    packed_seq::pack_ascii_direct(ascii_seq, seq_len, out_packed);
 
     return packed_len;
 }

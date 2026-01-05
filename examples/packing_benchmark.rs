@@ -61,8 +61,21 @@ fn main() {
         let mb = seq_len as f64 / 1_000_000.0;
         let throughput = mb / (ms_per_iter / 1000.0);
 
-        println!("C++ Packing (PEXT):");
+        println!("C++ Packing (via FFI with copy):");
         println!("  Time: {:.2} ms/iter", ms_per_iter);
+        println!("  Throughput: {:.0} MB/s", throughput);
+        println!();
+    }
+
+    // Benchmark C++ packing internally (no FFI copy overhead)
+    {
+        let total_us = simd_minimizers::cpp::cpp_benchmark_packing(&seq_data, iterations);
+        let us_per_iter = total_us as f64 / iterations as f64;
+        let mb = seq_len as f64 / 1_000_000.0;
+        let throughput = mb / (us_per_iter / 1_000_000.0);
+
+        println!("C++ Packing (internal, no FFI copy):");
+        println!("  Time: {:.2} ms/iter", us_per_iter / 1000.0);
         println!("  Throughput: {:.0} MB/s", throughput);
         println!();
     }
