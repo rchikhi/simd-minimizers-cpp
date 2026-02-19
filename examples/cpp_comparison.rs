@@ -151,12 +151,42 @@ fn main() {
 
     // C++ e2e: canonical already measured above as cpp_full_simd_time
 
-    // C++ e2e: syncmers (packs per call via FFI wrapper)
+    // Closed syncmer parameters: syncmer length 21, minimizer size 11
+    // C++ API: k=21 (syncmer length), m=11 (minimizer size)
+    // Rust API: closed_syncmers(k=11, w=11), syncmer length = k+w-1 = 21
+    // Both check: minimizer at prefix or suffix of window
     let syncmer_k = 21;
     let syncmer_m = 11;
     let cpp_e2e_syncmers = measure_time(|| {
         let mut out = Vec::new();
         simd_minimizers::cpp::cpp_syncmers_simd(&seq_data, syncmer_k as u32, syncmer_m as u32, &mut out);
+    }, iterations);
+
+    // Rust e2e: closed syncmers (pack + algorithm)
+    // C++ syncmers check prefix or suffix, which is "closed" in Rust terminology
+    let rust_e2e_syncmers = measure_time(|| {
+        let packed = PackedSeqVec::from_ascii(&seq_data);
+        let mut out = Vec::new();
+        simd_minimizers::closed_syncmers(syncmer_m, syncmer_m).run(packed.as_slice(), &mut out);
+    }, iterations);
+
+    // Rust pre-packed: closed syncmers
+    let rust_syncmers_prepacked_time = measure_time(|| {
+        let mut out = Vec::new();
+        simd_minimizers::closed_syncmers(syncmer_m, syncmer_m).run(packed_seq.as_slice(), &mut out);
+    }, iterations);
+
+    // Rust e2e: canonical closed syncmers (pack + algorithm)
+    let rust_e2e_canonical_syncmers = measure_time(|| {
+        let packed = PackedSeqVec::from_ascii(&seq_data);
+        let mut out = Vec::new();
+        simd_minimizers::canonical_closed_syncmers(syncmer_m, syncmer_m).run(packed.as_slice(), &mut out);
+    }, iterations);
+
+    // Rust pre-packed: canonical closed syncmers
+    let rust_canonical_syncmers_prepacked_time = measure_time(|| {
+        let mut out = Vec::new();
+        simd_minimizers::canonical_closed_syncmers(syncmer_m, syncmer_m).run(packed_seq.as_slice(), &mut out);
     }, iterations);
 
     // C++ pre-packed: syncmers (for completeness)
@@ -182,10 +212,19 @@ fn main() {
         cpp_full_simd_time.as_secs_f64() * 1000.0,
         mb / cpp_full_simd_time.as_secs_f64(),
         cpp_full_simd_time.as_secs_f64() * 1e9 / seq_len as f64);
+    println!("Rust syncmers             | {:9.2} | {:6.1} | {:5.2}",
+        rust_e2e_syncmers.as_secs_f64() * 1000.0,
+        mb / rust_e2e_syncmers.as_secs_f64(),
+        rust_e2e_syncmers.as_secs_f64() * 1e9 / seq_len as f64);
     println!("C++  syncmers             | {:9.2} | {:6.1} | {:5.2}",
         cpp_e2e_syncmers.as_secs_f64() * 1000.0,
         mb / cpp_e2e_syncmers.as_secs_f64(),
         cpp_e2e_syncmers.as_secs_f64() * 1e9 / seq_len as f64);
+    println!("Rust canonical syncmers   | {:9.2} | {:6.1} | {:5.2}",
+        rust_e2e_canonical_syncmers.as_secs_f64() * 1000.0,
+        mb / rust_e2e_canonical_syncmers.as_secs_f64(),
+        rust_e2e_canonical_syncmers.as_secs_f64() * 1e9 / seq_len as f64);
+    println!("C++  canonical syncmers   |         - |      - |     -");
 
     println!();
     println!("Pre-packed (algorithm only, packing EXCLUDED):");
@@ -207,10 +246,19 @@ fn main() {
         cpp_canonical_direct_time.as_secs_f64() * 1000.0,
         mb / cpp_canonical_direct_time.as_secs_f64(),
         cpp_canonical_direct_time.as_secs_f64() * 1e9 / seq_len as f64);
+    println!("Rust syncmers             | {:9.2} | {:6.1} | {:5.2}",
+        rust_syncmers_prepacked_time.as_secs_f64() * 1000.0,
+        mb / rust_syncmers_prepacked_time.as_secs_f64(),
+        rust_syncmers_prepacked_time.as_secs_f64() * 1e9 / seq_len as f64);
     println!("C++  syncmers             | {:9.2} | {:6.1} | {:5.2}",
         cpp_syncmers_prepacked_time.as_secs_f64() * 1000.0,
         mb / cpp_syncmers_prepacked_time.as_secs_f64(),
         cpp_syncmers_prepacked_time.as_secs_f64() * 1e9 / seq_len as f64);
+    println!("Rust canonical syncmers   | {:9.2} | {:6.1} | {:5.2}",
+        rust_canonical_syncmers_prepacked_time.as_secs_f64() * 1000.0,
+        mb / rust_canonical_syncmers_prepacked_time.as_secs_f64(),
+        rust_canonical_syncmers_prepacked_time.as_secs_f64() * 1e9 / seq_len as f64);
+    println!("C++  canonical syncmers   |         - |      - |     -");
 
     // 3-phase breakdown (for non-regression: main loop should dominate)
     println!();

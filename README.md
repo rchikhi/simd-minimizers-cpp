@@ -158,11 +158,12 @@ When compiled with Clang and `-O3 -mavx2 -march=native`, the C++ implementation 
 
 | Pipeline | C++ (Clang) | Rust SIMD |
 |----------|-------------|-----------|
-| Non-canonical | ~1000 MB/s | ~1075 MB/s |
-| Canonical | ~730 MB/s | ~800 MB/s |
-| Syncmers | ~950 MB/s | — |
+| Non-canonical minimizers | ~910 MB/s | ~930 MB/s |
+| Canonical minimizers | ~665 MB/s | ~695 MB/s |
+| Closed syncmers | ~895 MB/s | ~875 MB/s |
+| Canonical closed syncmers | — | ~670 MB/s |
 
-*Measured on Intel Core Ultra 5 135H @ 4.5 GHz, 1M bases, k=21, w=11.*
+*End-to-end (ASCII input), Intel Core Ultra 5 135H, 1M bases, k=21, w=11.*
 
 **Note**: GCC produces ~25-30% slower code. Use Clang for best results.
 
