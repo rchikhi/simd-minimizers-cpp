@@ -1,9 +1,9 @@
 # Makefile for standalone C++ builds (for debugging/testing outside Cargo)
 #
 # Usage:
-#   make          - Build test executable
+#   make          - Build example executable
+#   make check    - Compile check only
 #   make clean    - Remove built files
-#   make test     - Build and run tests
 
 CXX = g++
 CXXFLAGS = -std=c++17 -O3 -mavx2 -Wall -Wno-array-bounds -Wno-unused-variable -Wno-ignored-attributes -Wno-narrowing
@@ -12,16 +12,15 @@ CXXFLAGS = -std=c++17 -O3 -mavx2 -Wall -Wno-array-bounds -Wno-unused-variable -W
 SRCS = src/canonical_minimizers_simd.cpp src/canonical_minimizers_scalar.cpp
 HDRS = src/canonical_minimizers.hpp src/packed_seq.hpp
 
-.PHONY: all clean test syncmer_benchmark
+.PHONY: all clean check syncmer_benchmark
 
-all: test_cpp
+all: example
+
+example: src/example.cpp $(SRCS) $(HDRS)
+	$(CXX) $(CXXFLAGS) -o $@ src/example.cpp $(SRCS)
 
 syncmer_benchmark: src/syncmer_benchmark.cpp $(SRCS) $(HDRS)
 	$(CXX) $(CXXFLAGS) -o $@ src/syncmer_benchmark.cpp $(SRCS)
-
-# Build test executable (requires adding a main() to one of the cpp files or creating test_main.cpp)
-test_cpp: $(SRCS) $(HDRS)
-	$(CXX) $(CXXFLAGS) -DTEST_MAIN -o $@ $(SRCS)
 
 # Just compile to check for errors
 check: $(SRCS) $(HDRS)
@@ -31,4 +30,4 @@ check: $(SRCS) $(HDRS)
 	@rm -f /tmp/simd.o /tmp/scalar.o
 
 clean:
-	rm -f test_cpp syncmer_benchmark /tmp/simd.o /tmp/scalar.o
+	rm -f example syncmer_benchmark /tmp/simd.o /tmp/scalar.o

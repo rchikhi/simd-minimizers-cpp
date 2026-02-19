@@ -32,12 +32,30 @@ fn measure_time<F: FnMut()>(mut f: F, iterations: usize) -> Duration {
     start.elapsed() / iterations as u32
 }
 
+fn get_cpu_info() -> (String, String) {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let model = cpuinfo.lines()
+        .find(|l| l.starts_with("model name"))
+        .and_then(|l| l.split(':').nth(1))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let mhz = cpuinfo.lines()
+        .find(|l| l.starts_with("cpu MHz"))
+        .and_then(|l| l.split(':').nth(1))
+        .map(|s| format!("{:.2} GHz", s.trim().parse::<f64>().unwrap_or(0.0) / 1000.0))
+        .unwrap_or_else(|| "unknown".to_string());
+    (model, mhz)
+}
+
 fn main() {
     let seq_len = 1_000_000;
     let k = 21;
     let w = 11;
     let iterations = 20;
 
+    let (cpu_model, cpu_ghz) = get_cpu_info();
+    println!("C++ compiler: {}", env!("CPP_COMPILER"));
+    println!("CPU: {} @ {}", cpu_model, cpu_ghz);
     println!("Benchmark: seq_len={}, k={}, w={}", seq_len, k, w);
 
     // Generate test data

@@ -20,10 +20,28 @@ fn main() {
 
     let mut cc = cc::Build::new();
 
+    let compiler_name;
     if use_clang {
         cc.compiler("clang++");
         println!("cargo:warning=Using Clang for C++ compilation");
+        // Get clang version
+        compiler_name = std::process::Command::new("clang++")
+            .arg("--version")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.lines().next().map(|l| l.to_string()))
+            .unwrap_or_else(|| "clang++ (unknown version)".to_string());
+    } else {
+        compiler_name = std::process::Command::new("g++")
+            .arg("--version")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.lines().next().map(|l| l.to_string()))
+            .unwrap_or_else(|| "g++ (unknown version)".to_string());
     }
+    println!("cargo:rustc-env=CPP_COMPILER={}", compiler_name);
 
     cc.cpp(true)
         .file("src/canonical_minimizers_simd.cpp")

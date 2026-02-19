@@ -104,23 +104,7 @@ std::pair<std::vector<uint32_t>, std::vector<uint32_t>> sliding_lr_min_simd(
 // =============================================================================
 
 extern "C" {
-    // Main entry point for canonical minimizers
-    void canonical_minimizers_seq_simd_avx2(
-        const uint8_t* seq_data,
-        uint32_t seq_len,
-        uint32_t k,
-        uint32_t w,
-        uint32_t** out_ptr,
-        uint32_t* out_len
-    );
-
     // Test functions
-    int test_nthash_scalar_unrolled(
-        const uint8_t* seq_data,
-        uint32_t seq_len,
-        uint32_t k
-    );
-
     int test_sliding_min_scalar(
         const uint32_t* hashes,
         uint32_t hash_len,
@@ -148,27 +132,6 @@ extern "C" {
     );
 
     // Benchmark functions
-    uint64_t benchmark_nthash_scalar_unrolled(
-        const uint8_t* seq_data,
-        uint32_t seq_len,
-        uint32_t k,
-        uint32_t iterations
-    );
-
-    uint64_t benchmark_sliding_min_scalar(
-        const uint32_t* hashes,
-        uint32_t hash_len,
-        uint32_t w,
-        uint32_t iterations
-    );
-
-    uint64_t benchmark_sliding_min_simd(
-        const uint32_t* hashes,
-        uint32_t hash_len,
-        uint32_t w,
-        uint32_t iterations
-    );
-
     uint64_t benchmark_packed_seq_simd(
         const uint8_t* ascii_seq,
         uint32_t seq_len,
@@ -180,14 +143,6 @@ extern "C" {
         const uint8_t* ascii_seq,
         uint32_t seq_len,
         uint32_t k,
-        uint32_t iterations
-    );
-
-    uint64_t benchmark_hash_and_slidmin_only(
-        const uint8_t* ascii_seq,
-        uint32_t seq_len,
-        uint32_t k,
-        uint32_t w,
         uint32_t iterations
     );
 
@@ -214,5 +169,39 @@ extern "C" {
         uint32_t k
     );
 
-    void free_minimizers(uint32_t* ptr);
+    // =============================================================================
+    // Public API - Zero-copy functions for standalone use
+    // =============================================================================
+
+    // Compute canonical minimizer positions (SIMD, AVX2)
+    // Writes directly to caller-provided buffer, returns count
+    // Note: k+w-1 must be odd for canonical minimizers
+    uint32_t canonical_minimizers_to_buffer(
+        const uint8_t* seq_data,
+        uint32_t seq_len,
+        uint32_t k,
+        uint32_t w,
+        uint32_t* out_buf,
+        uint32_t out_capacity
+    );
+
+    // Non-canonical minimizers (faster, strand-dependent)
+    uint32_t noncanonical_minimizers_to_buffer(
+        const uint8_t* seq_data,
+        uint32_t seq_len,
+        uint32_t k,
+        uint32_t w,
+        uint32_t* out_buf,
+        uint32_t out_capacity
+    );
+
+    // Open syncmers (k-mers where minimizer is at prefix or suffix)
+    uint32_t syncmers_to_buffer(
+        const uint8_t* seq_data,
+        uint32_t seq_len,
+        uint32_t k,
+        uint32_t m,
+        uint32_t* out_buf,
+        uint32_t out_capacity
+    );
 }
