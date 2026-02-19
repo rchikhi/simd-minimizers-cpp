@@ -3,6 +3,7 @@
 //! The main functions are:
 //! - [`minimizer_positions`]: compute the positions of all minimizers of a sequence.
 //! - [`canonical_minimizer_positions`]: compute the positions of all _canonical_ minimizers of a sequence.
+//!
 //! Adjacent equal positions are deduplicated, but since the canonical minimizer is _not_ _forward_, a position could appear more than once.
 //!
 //! The implementation uses SIMD by splitting each sequence into 8 chunks and processing those in parallel.
@@ -11,8 +12,7 @@
 //!
 //! The minimizer of a single window can be found using [`one_minimizer`] and [`one_canonical_minimizer`], but note that these functions are not nearly as efficient.
 //!
-//! The [`scalar`] versions are mostly for testing only, and basically always slower.
-//! Only for short sequences with length up to 100 is [`scalar::minimizer_positions_scalar`] faster than the SIMD version.
+//! The `scalar` versions are mostly for testing only, and basically always slower.
 //!
 //! ## Minimizers
 //!
@@ -44,11 +44,19 @@
 //! 3. Compute the 'preferred' strand of the current window as the one with more `TG` characters. This requires `l=w+k-1` to be odd for proper tie-breaking.
 //! 4. Return either the leftmost or rightmost smallest k-mer, depending on the preferred strand.
 //!
+//! ## Syncmers
+//!
+//! _Syncmers_ are (in our notation) windows of length `l = w + k - 1` characters where the minimizer k-mer is a prefix or suffix.
+//! (Or, in classical notation, `k`-mers with the smallest `s`-mer as prefix or suffix.)
+//! These can be computed by using [`fn@syncmers`] or [`canonical_syncmers`] instead of [`minimizers`] or [`canonical_minimizers`].
+//!
+//! Note that canonical syncmers are chosen as the minimum of the forward and reverse-complement k-mer representation.
+//!
 //! ## Input types
 //!
-//! This crate depends on [`packed-seq`] to handle generic types of input sequences.
+//! This crate depends on [`packed_seq`] to handle generic types of input sequences.
 //! Most commonly, one should use [`packed_seq::PackedSeqVec`] for packed DNA sequences, but one can also simply wrap a sequence of `ACTGactg` characters in [`packed_seq::AsciiSeqVec`].
-//! Additionally, [`simd-minimizers`] works on general (ASCII) `&[u8]` text.
+//! Additionally, `simd_minimizers` works on general (ASCII) `&[u8]` text.
 //!
 //! The main function provided by [`packed_seq`] is [`packed_seq::Seq::iter_bp`], which splits the input into 8 chunks and iterates them in parallel using SIMD.
 //!
@@ -153,9 +161,10 @@ mod canonical;
 pub mod collect;
 mod minimizers;
 mod sliding_min;
+pub mod syncmers;
 mod intrinsics {
     mod dedup;
-    pub use dedup::{append_unique_vals, append_unique_vals_2};
+    pub use dedup::{append_filtered_vals, append_unique_vals, append_unique_vals_2};
 }
 
 #[cfg(test)]
@@ -218,12 +227,18 @@ use seq_hash::KmerHasher;
 pub use minimizers::one_minimizer;
 use seq_hash::NtHasher;
 pub use sliding_min::Cache;
+use syncmers::CollectSyncmers;
+use syncmers::collect_syncmers_scalar;
 
 thread_local! {
     static CACHE: std::cell::RefCell<(Cache, Vec<S>, Vec<S>)> = std::cell::RefCell::new(Default::default());
 }
 
-pub struct Builder<'h, const CANONICAL: bool, H: KmerHasher, SkPos> {
+/// `CANONICAL`: true for canonical minimizers.
+/// `H`: the kmer hasher to use.
+/// `SkPos`: type of super-k-mer position storage. Use `()` to disable super-k-mers.
+/// `SYNCMER`: 0 for minimizers, 1 for closed syncmers, 2 for open syncmers.
+pub struct Builder<'h, const CANONICAL: bool, H: KmerHasher, SkPos, const SYNCMER: u8> {
     k: usize,
     w: usize,
     hasher: Option<&'h H>,
@@ -231,13 +246,14 @@ pub struct Builder<'h, const CANONICAL: bool, H: KmerHasher, SkPos> {
 }
 
 pub struct Output<'o, const CANONICAL: bool, S> {
-    k: usize,
+    /// k for minimizers, k+w-1 for syncmers
+    len: usize,
     seq: S,
     min_pos: &'o Vec<u32>,
 }
 
 #[must_use]
-pub fn minimizers(k: usize, w: usize) -> Builder<'static, false, NtHasher<false>, ()> {
+pub const fn minimizers(k: usize, w: usize) -> Builder<'static, false, NtHasher<false>, (), 0> {
     Builder {
         k,
         w,
@@ -247,7 +263,10 @@ pub fn minimizers(k: usize, w: usize) -> Builder<'static, false, NtHasher<false>
 }
 
 #[must_use]
-pub fn canonical_minimizers(k: usize, w: usize) -> Builder<'static, true, NtHasher<true>, ()> {
+pub const fn canonical_minimizers(
+    k: usize,
+    w: usize,
+) -> Builder<'static, true, NtHasher<true>, (), 0> {
     Builder {
         k,
         w,
@@ -256,9 +275,75 @@ pub fn canonical_minimizers(k: usize, w: usize) -> Builder<'static, true, NtHash
     }
 }
 
-impl<const CANONICAL: bool> Builder<'static, CANONICAL, NtHasher<CANONICAL>, ()> {
+/// Return positions/values of *closed* syncmers of length `k+w-1`.
+///
+/// These are windows with the minimizer at the start or end of the window.
+///
+/// `k` here corresponds to `s` in original syncmer notation: the minimizer length.
+/// `k+w-1` corresponds to `k` in original syncmer notation: the length of the extracted string.
+#[must_use]
+pub const fn closed_syncmers(
+    k: usize,
+    w: usize,
+) -> Builder<'static, false, NtHasher<false>, (), 1> {
+    Builder {
+        k,
+        w,
+        hasher: None,
+        sk_pos: (),
+    }
+}
+
+#[must_use]
+pub const fn canonical_closed_syncmers(
+    k: usize,
+    w: usize,
+) -> Builder<'static, true, NtHasher<true>, (), 1> {
+    Builder {
+        k,
+        w,
+        hasher: None,
+        sk_pos: (),
+    }
+}
+
+/// Return positions/values of *open* syncmers of length `k+w-1`.
+///
+/// These are windows with the minimizer in the middle of the window. This requires `w` to be odd.
+///
+/// `k` here corresponds to `s` in original syncmer notation: the minimizer length.
+/// `k+w-1` corresponds to `k` in original syncmer notation: the length of the extracted string.
+#[must_use]
+pub const fn open_syncmers(k: usize, w: usize) -> Builder<'static, false, NtHasher<false>, (), 2> {
+    Builder {
+        k,
+        w,
+        hasher: None,
+        sk_pos: (),
+    }
+}
+
+#[must_use]
+pub const fn canonical_open_syncmers(
+    k: usize,
+    w: usize,
+) -> Builder<'static, true, NtHasher<true>, (), 2> {
+    Builder {
+        k,
+        w,
+        hasher: None,
+        sk_pos: (),
+    }
+}
+
+impl<const CANONICAL: bool, const SYNCMERS: u8>
+    Builder<'static, CANONICAL, NtHasher<CANONICAL>, (), SYNCMERS>
+{
     #[must_use]
-    pub fn hasher<'h, H2: KmerHasher>(&self, hasher: &'h H2) -> Builder<'h, CANONICAL, H2, ()> {
+    pub const fn hasher<'h, H2: KmerHasher>(
+        &self,
+        hasher: &'h H2,
+    ) -> Builder<'h, CANONICAL, H2, (), SYNCMERS> {
         Builder {
             k: self.k,
             w: self.w,
@@ -267,23 +352,25 @@ impl<const CANONICAL: bool> Builder<'static, CANONICAL, NtHasher<CANONICAL>, ()>
         }
     }
 }
-impl<'h, const CANONICAL: bool, H: KmerHasher> Builder<'h, CANONICAL, H, ()> {
+impl<'h, const CANONICAL: bool, H: KmerHasher> Builder<'h, CANONICAL, H, (), 0> {
     #[must_use]
-    pub fn super_kmers<'o2>(
+    pub const fn super_kmers<'o2>(
         &self,
         sk_pos: &'o2 mut Vec<u32>,
-    ) -> Builder<'h, CANONICAL, H, &'o2 mut Vec<u32>> {
+    ) -> Builder<'h, CANONICAL, H, &'o2 mut Vec<u32>, 0> {
         Builder {
             k: self.k,
             w: self.w,
             hasher: self.hasher,
-            sk_pos: sk_pos,
+            sk_pos,
         }
     }
 }
 
 /// Without-superkmer version
-impl<'h, const CANONICAL: bool, H: KmerHasher> Builder<'h, CANONICAL, H, ()> {
+impl<'h, const CANONICAL: bool, H: KmerHasher, const SYNCMERS: u8>
+    Builder<'h, CANONICAL, H, (), SYNCMERS>
+{
     pub fn run_scalar_once<'s, SEQ: Seq<'s>>(&self, seq: SEQ) -> Vec<u32> {
         let mut min_pos = vec![];
         self.run_impl::<false, _>(seq, &mut min_pos);
@@ -348,30 +435,63 @@ impl<'h, const CANONICAL: bool, H: KmerHasher> Builder<'h, CANONICAL, H, ()> {
             .hasher
             .unwrap_or_else(|| default_hasher.as_ref().unwrap());
 
-        CACHE.with_borrow_mut(|cache| match (SIMD, CANONICAL) {
-            (false, false) => collect_and_dedup_into_scalar(
+        CACHE.with_borrow_mut(|cache| match (SIMD, CANONICAL, SYNCMERS) {
+            (false, false, 0) => collect_and_dedup_into_scalar(
                 minimizers_seq_scalar(seq, hasher, self.w, &mut cache.0),
                 min_pos,
             ),
-            (false, true) => collect_and_dedup_into_scalar(
+            (false, false, 1) => collect_syncmers_scalar::<false>(
+                self.w,
+                minimizers_seq_scalar(seq, hasher, self.w, &mut cache.0),
+                min_pos,
+            ),
+            (false, false, 2) => collect_syncmers_scalar::<true>(
+                self.w,
+                minimizers_seq_scalar(seq, hasher, self.w, &mut cache.0),
+                min_pos,
+            ),
+            (false, true, 0) => collect_and_dedup_into_scalar(
                 canonical_minimizers_seq_scalar(seq, hasher, self.w, &mut cache.0),
                 min_pos,
             ),
-            (true, false) => minimizers_seq_simd(seq, hasher, self.w, &mut cache.0)
+            (false, true, 1) => collect_syncmers_scalar::<false>(
+                self.w,
+                canonical_minimizers_seq_scalar(seq, hasher, self.w, &mut cache.0),
+                min_pos,
+            ),
+            (false, true, 2) => collect_syncmers_scalar::<true>(
+                self.w,
+                canonical_minimizers_seq_scalar(seq, hasher, self.w, &mut cache.0),
+                min_pos,
+            ),
+            (true, false, 0) => minimizers_seq_simd(seq, hasher, self.w, &mut cache.0)
                 .collect_and_dedup_into::<false>(min_pos),
-            (true, true) => canonical_minimizers_seq_simd(seq, hasher, self.w, &mut cache.0)
+            (true, false, 1) => minimizers_seq_simd(seq, hasher, self.w, &mut cache.0)
+                .collect_syncmers_into::<false>(self.w, min_pos),
+            (true, false, 2) => minimizers_seq_simd(seq, hasher, self.w, &mut cache.0)
+                .collect_syncmers_into::<true>(self.w, min_pos),
+            (true, true, 0) => canonical_minimizers_seq_simd(seq, hasher, self.w, &mut cache.0)
                 .collect_and_dedup_into::<false>(min_pos),
+            (true, true, 1) => canonical_minimizers_seq_simd(seq, hasher, self.w, &mut cache.0)
+                .collect_syncmers_into::<false>(self.w, min_pos),
+            (true, true, 2) => canonical_minimizers_seq_simd(seq, hasher, self.w, &mut cache.0)
+                .collect_syncmers_into::<true>(self.w, min_pos),
+            _ => unreachable!("SYNCMERS generic must be 0 (no syncmers), 1 (closed syncmers), or 2 (open syncmers)."),
         });
         Output {
-            k: self.k,
+            len: if SYNCMERS != 0 {
+                self.k + self.w - 1
+            } else {
+                self.k
+            },
             seq,
             min_pos,
         }
     }
 }
 
-impl<'h, H: KmerHasher> Builder<'h, true, H, ()> {
-    pub fn run_skip_ambiguous_windows_once<'s, 'o>(&self, nseq: PackedNSeq<'s>) -> Vec<u32> {
+impl<'h, H: KmerHasher, const SYNCMERS: u8> Builder<'h, true, H, (), SYNCMERS> {
+    pub fn run_skip_ambiguous_windows_once<'s>(&self, nseq: PackedNSeq<'s>) -> Vec<u32> {
         let mut min_pos = vec![];
         self.run_skip_ambiguous_windows(nseq, &mut min_pos);
         min_pos
@@ -394,10 +514,23 @@ impl<'h, H: KmerHasher> Builder<'h, true, H, ()> {
         let hasher = self
             .hasher
             .unwrap_or_else(|| default_hasher.as_ref().unwrap());
-        canonical_minimizers_skip_ambiguous_windows(nseq, hasher, self.w, cache)
-            .collect_and_dedup_into::<true>(min_pos);
+        match SYNCMERS {
+            0 => canonical_minimizers_skip_ambiguous_windows(nseq, hasher, self.w, cache)
+                .collect_and_dedup_into::<true>(min_pos),
+            1 => canonical_minimizers_skip_ambiguous_windows(nseq, hasher, self.w, cache)
+                .collect_syncmers_into::<false>(self.w, min_pos),
+            2 => canonical_minimizers_skip_ambiguous_windows(nseq, hasher, self.w, cache)
+                .collect_syncmers_into::<true>(self.w, min_pos),
+            _ => panic!(
+                "SYNCMERS generic must be 0 (no syncmers), 1 (closed syncmers), or 2 (open syncmers)."
+            ),
+        }
         Output {
-            k: self.k,
+            len: if SYNCMERS != 0 {
+                self.k + self.w - 1
+            } else {
+                self.k
+            },
             seq: nseq.seq,
             min_pos,
         }
@@ -405,7 +538,11 @@ impl<'h, H: KmerHasher> Builder<'h, true, H, ()> {
 }
 
 /// With-superkmer version
-impl<'h, 'o2, const CANONICAL: bool, H: KmerHasher> Builder<'h, CANONICAL, H, &'o2 mut Vec<u32>> {
+///
+/// (does not work in combination with syncmers)
+impl<'h, 'o2, const CANONICAL: bool, H: KmerHasher>
+    Builder<'h, CANONICAL, H, &'o2 mut Vec<u32>, 0>
+{
     pub fn run_scalar_once<'s, SEQ: Seq<'s>>(self, seq: SEQ) -> Vec<u32> {
         let mut min_pos = vec![];
         self.run_scalar(seq, &mut min_pos);
@@ -435,7 +572,7 @@ impl<'h, 'o2, const CANONICAL: bool, H: KmerHasher> Builder<'h, CANONICAL, H, &'
             ),
         });
         Output {
-            k: self.k,
+            len: self.k,
             seq,
             min_pos,
         }
@@ -474,7 +611,7 @@ impl<'h, 'o2, const CANONICAL: bool, H: KmerHasher> Builder<'h, CANONICAL, H, &'
                 .collect_and_dedup_with_index_into(min_pos, self.sk_pos),
         };
         Output {
-            k: self.k,
+            len: self.k,
             seq,
             min_pos,
         }
@@ -499,11 +636,11 @@ impl<'s, 'o, const CANONICAL: bool, SEQ: Seq<'s>> Output<'o, CANONICAL, SEQ> {
             #[inline(always)]
             move |&pos| {
                 let val = if CANONICAL {
-                    let a = self.seq.read_kmer(self.k, pos as usize);
-                    let b = self.seq.read_revcomp_kmer(self.k, pos as usize);
+                    let a = self.seq.read_kmer(self.len, pos as usize);
+                    let b = self.seq.read_revcomp_kmer(self.len, pos as usize);
                     core::cmp::min(a, b)
                 } else {
-                    self.seq.read_kmer(self.k, pos as usize)
+                    self.seq.read_kmer(self.len, pos as usize)
                 };
                 (pos, val)
             },
@@ -516,11 +653,11 @@ impl<'s, 'o, const CANONICAL: bool, SEQ: Seq<'s>> Output<'o, CANONICAL, SEQ> {
             #[inline(always)]
             move |&pos| {
                 let val = if CANONICAL {
-                    let a = self.seq.read_kmer_u128(self.k, pos as usize);
-                    let b = self.seq.read_revcomp_kmer_u128(self.k, pos as usize);
+                    let a = self.seq.read_kmer_u128(self.len, pos as usize);
+                    let b = self.seq.read_revcomp_kmer_u128(self.len, pos as usize);
                     core::cmp::min(a, b)
                 } else {
-                    self.seq.read_kmer_u128(self.k, pos as usize)
+                    self.seq.read_kmer_u128(self.len, pos as usize)
                 };
                 (pos, val)
             },
