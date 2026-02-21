@@ -71,7 +71,11 @@ Reuse output vectors between calls for best performance.
 
 C++ implementation in `src/canonical_minimizers_simd.cpp` compiled via `build.rs` using Clang (auto-detected, use `CC_GCC=1` to force GCC).
 
-Performance: C++ ~461 MB/s vs Rust ~439 MB/s (non-canonical), roughly equal for canonical.
+Performance with Clang (C++ and Rust within ~5% of each other, measured e2e on Intel Core Ultra 5 135H):
+- Non-canonical minimizers: ~930 MB/s
+- Canonical minimizers: ~680 MB/s
+- Closed syncmers: ~890 MB/s
+- GCC is ~25-30% slower; use Clang for best results.
 
 ## Testing
 
