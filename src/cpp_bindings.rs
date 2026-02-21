@@ -273,9 +273,9 @@ pub fn cpp_syncmers_simd(
         return;
     }
 
-    // Pre-allocate buffer
-    let w = k - m + 1;
-    let max_positions = seq_data.len() / w as usize + 8;
+    // Pre-allocate buffer: syncmer density is ~2/w (prefix OR suffix), not ~1/w
+    let num_windows = seq_data.len() - k as usize + 1;
+    let max_positions = num_windows;
     out_syncmers.reserve(max_positions);
 
     // Use zerocopy: write directly to Vec's spare capacity
@@ -713,6 +713,107 @@ mod tests {
             assert_eq!(rust, cpp, "Canonical hash mismatch at position {}", i);
         }
     }
+    #[test]
+    fn test_cpp_vs_rust_syncmers() {
+        let bases = b"ACGT";
+        let seq: Vec<u8> = (0..1000)
+            .map(|i| {
+                let x = (i as u32).wrapping_mul(1103515245).wrapping_add(12345);
+                bases[(x >> 16) as usize % 4]
+            })
+            .collect();
+
+        let k_outer = 21u32; // syncmer k-mer size (C++ convention)
+        let m = 11u32;       // s-mer size
+        let w = k_outer - m + 1; // window size = 11
+
+        let packed = PackedSeqVec::from_ascii(&seq);
+
+        // Rust: use closed_syncmers API (k=s-mer size, w=window size)
+        let mut rust_syncmers = Vec::new();
+        crate::closed_syncmers(m as usize, w as usize).run(packed.as_slice(), &mut rust_syncmers);
+
+        // C++
+        let mut cpp_syncmers = Vec::new();
+        cpp_syncmers_simd(&seq, k_outer, m, &mut cpp_syncmers);
+
+        // Sort + dedup both
+        rust_syncmers.sort();
+        rust_syncmers.dedup();
+        cpp_syncmers.sort();
+        cpp_syncmers.dedup();
+
+        eprintln!("Rust syncmers: {} positions", rust_syncmers.len());
+        eprintln!("C++  syncmers: {} positions", cpp_syncmers.len());
+
+        // Check which positions are prefix vs suffix syncmers using run_all
+        let all_min_pos = crate::minimizers(m as usize, w as usize).run_all_once(packed.as_slice());
+
+        // Count prefix/suffix for Rust results
+        let num_windows = seq.len() - k_outer as usize + 1;
+        let mut prefix_count = 0;
+        let mut suffix_count = 0;
+        for (i, &min_pos) in all_min_pos.iter().enumerate().take(num_windows) {
+            if min_pos as usize == i {
+                prefix_count += 1;
+            }
+            if min_pos as usize == i + w as usize - 1 {
+                suffix_count += 1;
+            }
+        }
+        eprintln!("Windows where min at prefix: {}", prefix_count);
+        eprintln!("Windows where min at suffix: {}", suffix_count);
+
+        // Show first differences
+        if rust_syncmers != cpp_syncmers {
+            let mut shown = 0;
+            let (mut ri, mut ci) = (0, 0);
+            let mut missing_count = 0;
+            let mut extra_count = 0;
+            while ri < rust_syncmers.len() || ci < cpp_syncmers.len() {
+                if ri >= rust_syncmers.len() {
+                    extra_count += 1;
+                    if shown < 20 {
+                        eprintln!("  Extra in C++: {}", cpp_syncmers[ci]);
+                        shown += 1;
+                    }
+                    ci += 1;
+                } else if ci >= cpp_syncmers.len() {
+                    missing_count += 1;
+                    if shown < 20 {
+                        eprintln!("  Missing in C++: {}", rust_syncmers[ri]);
+                        shown += 1;
+                    }
+                    ri += 1;
+                } else if rust_syncmers[ri] < cpp_syncmers[ci] {
+                    missing_count += 1;
+                    if shown < 20 {
+                        eprintln!("  Missing in C++: {}", rust_syncmers[ri]);
+                        shown += 1;
+                    }
+                    ri += 1;
+                } else if cpp_syncmers[ci] < rust_syncmers[ri] {
+                    extra_count += 1;
+                    if shown < 20 {
+                        eprintln!("  Extra in C++: {}", cpp_syncmers[ci]);
+                        shown += 1;
+                    }
+                    ci += 1;
+                } else {
+                    ri += 1;
+                    ci += 1;
+                }
+            }
+            eprintln!("Total missing in C++: {}", missing_count);
+            eprintln!("Total extra in C++:   {}", extra_count);
+        }
+
+        assert_eq!(
+            rust_syncmers, cpp_syncmers,
+            "C++ and Rust syncmer positions differ"
+        );
+    }
+
     #[test]
     fn test_cpp_nthash_vs_rust() {
         use seq_hash::{KmerHasher, NtHasher};

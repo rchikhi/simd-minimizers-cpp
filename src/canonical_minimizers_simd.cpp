@@ -948,7 +948,16 @@ void syncmers_simd_fused_packed(
                 transpose_8x8(batch, t);
                 size_t batch_start = batch_count - 8;
 
-                // SAME STRUCTURE AS MINIMIZERS (for testing)
+                // Validity check for tail batches (same as minimizer code)
+                if (batch_start >= fast_path_limit) {
+                    for (int j = 0; j < 8; j++) {
+                        u32x8 window_base = _mm256_set1_epi32((uint32_t)(j * chunk_size + batch_start));
+                        u32x8 window_indices = _mm256_add_epi32(window_base, idx_offsets);
+                        u32x8 mask = _mm256_cmpgt_epi32(valid_limit, window_indices);
+                        t[j] = _mm256_blendv_epi8(SIMD_MAX, t[j], mask);
+                    }
+                }
+
                 for (int j = 0; j < 8; j++) {
                     // Compute lane_offsets for this lane
                     u32x8 lane_offsets = _mm256_add_epi32(
