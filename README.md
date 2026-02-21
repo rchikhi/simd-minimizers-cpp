@@ -128,7 +128,7 @@ uint32_t noncanonical_minimizers_to_buffer(
     uint32_t* out_buf, uint32_t out_capacity
 );
 
-// Open syncmers (k-mers where minimizer is at prefix or suffix)
+// Closed syncmers (k-mers where minimizer is at prefix or suffix)
 uint32_t syncmers_to_buffer(
     const uint8_t* seq_data, uint32_t seq_len,
     uint32_t k, uint32_t m,    // k = syncmer size, m = minimizer size

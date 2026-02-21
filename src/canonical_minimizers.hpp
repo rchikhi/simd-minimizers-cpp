@@ -195,7 +195,7 @@ extern "C" {
         uint32_t out_capacity
     );
 
-    // Open syncmers (k-mers where minimizer is at prefix or suffix)
+    // Closed syncmers (k-mers where minimizer is at prefix or suffix)
     uint32_t syncmers_to_buffer(
         const uint8_t* seq_data,
         uint32_t seq_len,
